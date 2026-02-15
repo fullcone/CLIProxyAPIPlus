@@ -679,12 +679,12 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 				ctx.ToolResults = filtered
 				if len(ctx.ToolResults) == 0 && len(ctx.Tools) == 0 {
 					h.UserInputMessage.UserInputMessageContext = nil
-					// Content fallback: if all tool_results were orphaned and removed,
-					// the content "Tool results provided." is now misleading — revert to "Continue"
-					if strings.TrimSpace(h.UserInputMessage.Content) == kirocommon.DefaultUserContentWithToolResults {
-						h.UserInputMessage.Content = kirocommon.DefaultUserContent
-						log.Debugf("kiro: history[%d] content reverted from '%s' to '%s' after orphaned tool_result removal", i, kirocommon.DefaultUserContentWithToolResults, kirocommon.DefaultUserContent)
-					}
+				}
+				// Content fallback: if all tool_results were orphaned and content still says "Tool results provided.",
+				// revert to "Continue" since there are no tool results anymore
+				if len(ctx.ToolResults) == 0 && strings.TrimSpace(h.UserInputMessage.Content) == kirocommon.DefaultUserContentWithToolResults {
+					h.UserInputMessage.Content = kirocommon.DefaultUserContent
+					log.Debugf("kiro: history[%d] content reverted from '%s' to '%s' after orphan filtering", i, kirocommon.DefaultUserContentWithToolResults, kirocommon.DefaultUserContent)
 				}
 			}
 		}
@@ -704,12 +704,12 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 			log.Infof("kiro: dropped %d orphaned tool_result(s) from currentMessage (compaction artifact)", len(currentToolResults)-len(filtered))
 		}
 		currentToolResults = filtered
-		// Content fallback: if all tool_results were orphaned and removed,
-		// the content "Tool results provided." is now misleading — revert to "Continue"
-		if len(filtered) == 0 && currentUserMsg != nil && strings.TrimSpace(currentUserMsg.Content) == kirocommon.DefaultUserContentWithToolResults {
-			currentUserMsg.Content = kirocommon.DefaultUserContent
-			log.Debugf("kiro: currentMessage content reverted from '%s' to '%s' after orphaned tool_result removal", kirocommon.DefaultUserContentWithToolResults, kirocommon.DefaultUserContent)
-		}
+	}
+
+	// Content fallback for currentMessage: if all tool_results were orphaned, revert content
+	if currentUserMsg != nil && len(currentToolResults) == 0 && strings.TrimSpace(currentUserMsg.Content) == kirocommon.DefaultUserContentWithToolResults {
+		currentUserMsg.Content = kirocommon.DefaultUserContent
+		log.Debugf("kiro: currentMessage content reverted from '%s' to '%s' after orphan filtering", kirocommon.DefaultUserContentWithToolResults, kirocommon.DefaultUserContent)
 	}
 
 	return history, currentUserMsg, currentToolResults

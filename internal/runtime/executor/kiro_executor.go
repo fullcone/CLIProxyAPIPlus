@@ -640,8 +640,7 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		remaining := cooldownMgr.GetRemainingCooldown(tokenKey)
 		reason := cooldownMgr.GetCooldownReason(tokenKey)
 		log.Warnf("kiro: token %s is in cooldown (reason: %s), remaining: %v", tokenKey, reason, remaining)
-		retryAfter := remaining.Round(time.Second)
-		return resp, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason), retryAfter: &retryAfter}
+		return resp, fmt.Errorf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason)
 	}
 
 	// Wait for rate limiter before proceeding
@@ -786,13 +785,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				AuthValue: authValue,
 			})
 
-			// Use timeout=0 (no client-side timeout) for non-streaming path too,
-			// because parseEventStream reads the response body incrementally.
-			// A fixed timeout (e.g. 120s) would kill the body read mid-stream
-			// if the upstream LLM is slow (large prompt, heavy reasoning, etc.).
-			// Let the upstream decide when to timeout; the caller's request context
-			// (via GetContextWithCancel) already handles client disconnects.
-			httpClient := newKiroHTTPClientWithPooling(ctx, e.cfg, auth, 0)
+			httpClient := newKiroHTTPClientWithPooling(ctx, e.cfg, auth, 120*time.Second)
 			httpResp, err := httpClient.Do(httpReq)
 			if err != nil {
 				// Check for context cancellation first - client disconnected, not a server error
@@ -1076,8 +1069,7 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		remaining := cooldownMgr.GetRemainingCooldown(tokenKey)
 		reason := cooldownMgr.GetCooldownReason(tokenKey)
 		log.Warnf("kiro: token %s is in cooldown (reason: %s), remaining: %v", tokenKey, reason, remaining)
-		retryAfter := remaining.Round(time.Second)
-		return nil, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason), retryAfter: &retryAfter}
+		return nil, fmt.Errorf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason)
 	}
 
 	// Wait for rate limiter before proceeding

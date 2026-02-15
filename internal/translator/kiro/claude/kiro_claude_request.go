@@ -680,13 +680,6 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 				if len(ctx.ToolResults) == 0 && len(ctx.Tools) == 0 {
 					h.UserInputMessage.UserInputMessageContext = nil
 				}
-				// If all tool results were orphaned and content was set to the
-				// tool-results default, fall back to the generic default.
-				if len(ctx.ToolResults) == 0 &&
-					strings.TrimSpace(h.UserInputMessage.Content) == kirocommon.DefaultUserContentWithToolResults {
-					h.UserInputMessage.Content = kirocommon.DefaultUserContent
-					log.Debugf("kiro: history[%d] all tool_results orphaned, falling back content to: %s", i, h.UserInputMessage.Content)
-				}
 			}
 		}
 	}
@@ -705,14 +698,6 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 			log.Infof("kiro: dropped %d orphaned tool_result(s) from currentMessage (compaction artifact)", len(currentToolResults)-len(filtered))
 		}
 		currentToolResults = filtered
-
-		// If all tool results were orphaned and content was set to the tool-results
-		// default, fall back to the generic default since there are no tool results anymore.
-		if len(currentToolResults) == 0 && currentUserMsg != nil &&
-			strings.TrimSpace(currentUserMsg.Content) == kirocommon.DefaultUserContentWithToolResults {
-			currentUserMsg.Content = kirocommon.DefaultUserContent
-			log.Debugf("kiro: all tool_results were orphaned, falling back content to: %s", currentUserMsg.Content)
-		}
 	}
 
 	return history, currentUserMsg, currentToolResults

@@ -51,7 +51,7 @@ const (
 	refreshPendingBackoff = time.Minute
 	refreshFailureBackoff = 1 * time.Minute
 	quotaBackoffBase      = time.Second
-	quotaBackoffMax       = 30 * time.Minute
+	quotaBackoffMax       = 1 * time.Minute
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -1514,12 +1514,10 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) 
 	if disableCooling {
 		return 0, prevLevel
 	}
-	cooldown := quotaBackoffBase * time.Duration(1<<prevLevel)
-	if cooldown < quotaBackoffBase {
-		cooldown = quotaBackoffBase
-	}
-	if cooldown >= quotaBackoffMax {
-		return quotaBackoffMax, prevLevel
+	// Exponential backoff: 1s, 2s, 4s, 8s, ... capped at quotaBackoffMax (1 minute)
+	cooldown := quotaBackoffBase << uint(prevLevel)
+	if cooldown > quotaBackoffMax {
+		cooldown = quotaBackoffMax
 	}
 	return cooldown, prevLevel + 1
 }

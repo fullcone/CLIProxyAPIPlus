@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"crypto/tls"
 	"net"
 	"net/http"
 	"net/url"
@@ -38,28 +39,31 @@ var (
 // Returns:
 //   - *http.Client: An HTTP client with configured proxy or transport
 func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	// Check for IPv6 source address binding (Codex per-account IPv6)
+	// Check for IPv6 source address binding (Codex accounts only)
 	var ipv6Addr string
 	if auth != nil && auth.Metadata != nil {
-		if v, ok := auth.Metadata["ipv6"].(string); ok && v != "" {
-			ipv6Addr = v
+		if v, ok := auth.Metadata["ipv6"].(string); ok {
+			ipv6Addr = strings.TrimSpace(v)
 		}
 	}
 
+	// If IPv6 address is available, create a client with IP_FREEBIND + LocalAddr
 	if ipv6Addr != "" {
-		// Build cache key including IPv6 address
+		// Priority 1: Use auth.ProxyURL if configured
 		var proxyURL string
 		if auth != nil {
 			proxyURL = strings.TrimSpace(auth.ProxyURL)
 		}
+		// Priority 2: Use cfg.ProxyURL if auth proxy is not configured
 		if proxyURL == "" && cfg != nil {
 			proxyURL = strings.TrimSpace(cfg.ProxyURL)
 		}
+
 		var authID string
 		if auth != nil {
 			authID = auth.ID
 		}
-		cacheKey := proxyURL + "|" + authID + "|ipv6=" + ipv6Addr
+		cacheKey := "ipv6:" + ipv6Addr + "|" + proxyURL + "|" + authID
 
 		httpClientCacheMutex.RLock()
 		if cachedClient, ok := httpClientCache[cacheKey]; ok {
@@ -74,34 +78,33 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		}
 		httpClientCacheMutex.RUnlock()
 
-		// Create dialer with IPV6_FREEBIND and LocalAddr
-		srcIP := net.ParseIP(ipv6Addr)
+		localAddr := &net.TCPAddr{IP: net.ParseIP(ipv6Addr)}
 		dialer := &net.Dialer{
-			LocalAddr: &net.TCPAddr{IP: srcIP},
+			LocalAddr: localAddr,
 			Timeout:   30 * time.Second,
 			KeepAlive: 30 * time.Second,
 			Control: func(network, address string, c syscall.RawConn) error {
-				var sErr error
-				if errCtrl := c.Control(func(fd uintptr) {
+				var opErr error
+				if err := c.Control(func(fd uintptr) {
 					// IPV6_FREEBIND = 78 on Linux (not exported by syscall package)
-					sErr = syscall.SetsockoptInt(int(fd), syscall.SOL_IPV6, 78, 1)
-				}); errCtrl != nil {
-					return errCtrl
+					opErr = syscall.SetsockoptInt(int(fd), syscall.SOL_IPV6, 78, 1)
+				}); err != nil {
+					return err
 				}
-				return sErr
+				return opErr
 			},
 		}
-
 		transport := &http.Transport{
 			DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
-				conn, err := dialer.DialContext(dialCtx, "tcp6", addr)
+				conn, err := dialer.DialContext(dialCtx, network, addr)
 				if err != nil {
-					log.Warnf("IPv6 dial failed: src=%s dst=%s err=%v", ipv6Addr, addr, err)
+					log.Warnf("ipv6 dial failed: src=%s dst=%s err=%v", ipv6Addr, addr, err)
 					return nil, err
 				}
-				log.Debugf("IPv6 dial ok: src=%s dst=%s local=%s", ipv6Addr, addr, conn.LocalAddr())
+				log.Debugf("ipv6 dial ok: src=%s dst=%s local=%s", ipv6Addr, addr, conn.LocalAddr())
 				return conn, nil
 			},
+			TLSClientConfig:    &tls.Config{},
 			MaxIdleConns:        100,
 			IdleConnTimeout:     90 * time.Second,
 			TLSHandshakeTimeout: 10 * time.Second,
@@ -115,6 +118,7 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		httpClientCacheMutex.Lock()
 		httpClientCache[cacheKey] = httpClient
 		httpClientCacheMutex.Unlock()
+
 		return httpClient
 	}
 

@@ -640,7 +640,8 @@ func (e *KiroExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		remaining := cooldownMgr.GetRemainingCooldown(tokenKey)
 		reason := cooldownMgr.GetCooldownReason(tokenKey)
 		log.Warnf("kiro: token %s is in cooldown (reason: %s), remaining: %v", tokenKey, reason, remaining)
-		return resp, fmt.Errorf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason)
+		retryAfter := remaining.Round(time.Second)
+		return resp, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason), retryAfter: &retryAfter}
 	}
 
 	// Wait for rate limiter before proceeding
@@ -785,7 +786,7 @@ func (e *KiroExecutor) executeWithRetry(ctx context.Context, auth *cliproxyauth.
 				AuthValue: authValue,
 			})
 
-			httpClient := newKiroHTTPClientWithPooling(ctx, e.cfg, auth, 120*time.Second)
+			httpClient := newKiroHTTPClientWithPooling(ctx, e.cfg, auth, 0)
 			httpResp, err := httpClient.Do(httpReq)
 			if err != nil {
 				// Check for context cancellation first - client disconnected, not a server error
@@ -1069,7 +1070,8 @@ func (e *KiroExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		remaining := cooldownMgr.GetRemainingCooldown(tokenKey)
 		reason := cooldownMgr.GetCooldownReason(tokenKey)
 		log.Warnf("kiro: token %s is in cooldown (reason: %s), remaining: %v", tokenKey, reason, remaining)
-		return nil, fmt.Errorf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason)
+		retryAfter := remaining.Round(time.Second)
+		return nil, statusErr{code: http.StatusTooManyRequests, msg: fmt.Sprintf("kiro: token is in cooldown for %v (reason: %s)", remaining, reason), retryAfter: &retryAfter}
 	}
 
 	// Wait for rate limiter before proceeding

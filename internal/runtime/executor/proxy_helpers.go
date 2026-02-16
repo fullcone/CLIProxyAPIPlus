@@ -48,8 +48,12 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
-	// Build cache key from proxy URL (empty string for no proxy)
-	cacheKey := proxyURL
+	// Build cache key from proxy URL + auth ID to isolate connection pools per auth
+	var authID string
+	if auth != nil {
+		authID = auth.ID
+	}
+	cacheKey := proxyURL + "|" + authID
 
 	// Check cache first
 	httpClientCacheMutex.RLock()

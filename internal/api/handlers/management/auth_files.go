@@ -261,10 +261,41 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		h.listAuthFilesFromDisk(c)
 		return
 	}
+
+	// Optional query parameter filters
+	filterStatus := strings.TrimSpace(c.Query("status"))
+	filterUnavailable := strings.TrimSpace(c.Query("unavailable"))
+	filterProvider := strings.TrimSpace(c.Query("provider"))
+
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
+			// Filter by status (matches status_message or status field, case-insensitive)
+			if filterStatus != "" {
+				statusMsg, _ := entry["status_message"].(string)
+				status, _ := entry["status"].(string)
+				if !strings.EqualFold(statusMsg, filterStatus) && !strings.EqualFold(status, filterStatus) {
+					continue
+				}
+			}
+			// Filter by unavailable flag
+			if filterUnavailable != "" {
+				unavailable, _ := entry["unavailable"].(bool)
+				if filterUnavailable == "true" && !unavailable {
+					continue
+				}
+				if filterUnavailable == "false" && unavailable {
+					continue
+				}
+			}
+			// Filter by provider (case-insensitive)
+			if filterProvider != "" {
+				provider, _ := entry["provider"].(string)
+				if !strings.EqualFold(provider, filterProvider) {
+					continue
+				}
+			}
 			files = append(files, entry)
 		}
 	}

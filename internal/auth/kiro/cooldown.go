@@ -98,9 +98,9 @@ func (cm *CooldownManager) StartCleanupRoutine(interval time.Duration, stopCh <-
 }
 
 func CalculateCooldownFor429(retryCount int) time.Duration {
-	duration := DefaultShortCooldown * time.Duration(1<<retryCount)
-	if duration > MaxShortCooldown {
-		return MaxShortCooldown
+	duration := time.Second << uint(retryCount) // 1s, 2s, 4s, 8s, 16s, 32s...
+	if duration > DefaultShortCooldown {
+		return DefaultShortCooldown // cap at 1 minute instead of 5 minutes
 	}
 	return duration
 }

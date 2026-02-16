@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
@@ -37,7 +38,8 @@ var dataTag = []byte("data:")
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type CodexExecutor struct {
-	cfg *config.Config
+	cfg            *config.Config
+	codexAuthCache sync.Map // key: auth.ID (string), value: *codexauth.CodexAuth
 }
 
 func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor{cfg: cfg} }
@@ -572,7 +574,13 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	if refreshToken == "" {
 		return auth, nil
 	}
-	svc := codexauth.NewCodexAuth(e.cfg)
+	var svc *codexauth.CodexAuth
+	if cached, ok := e.codexAuthCache.Load(auth.ID); ok {
+		svc = cached.(*codexauth.CodexAuth)
+	} else {
+		svc = codexauth.NewCodexAuth(e.cfg)
+		e.codexAuthCache.Store(auth.ID, svc)
+	}
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
 		return nil, err

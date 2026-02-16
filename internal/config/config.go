@@ -122,6 +122,11 @@ type Config struct {
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
+	// IPv6Prefix is the IPv6 CIDR prefix used for per-account IPv6 source address binding.
+	// When set, each Codex account is assigned a fixed IPv6 address from this prefix.
+	// Format: "2607:8700:5501:979f::2/64"
+	IPv6Prefix string `yaml:"ipv6-prefix" json:"-"`
+
 	// IncognitoBrowser enables opening OAuth URLs in incognito/private browsing mode.
 	// This is useful when you want to login with a different account without logging out
 	// from your current session. Default: false.

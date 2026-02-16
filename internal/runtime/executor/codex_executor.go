@@ -578,7 +578,18 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	if cached, ok := e.codexAuthCache.Load(auth.ID); ok {
 		svc = cached.(*codexauth.CodexAuth)
 	} else {
-		svc = codexauth.NewCodexAuth(e.cfg)
+		// Pass IPv6 address to CodexAuth so token refresh uses the same source IP
+		var ipv6Addr string
+		if auth.Metadata != nil {
+			if v, ok := auth.Metadata["ipv6"].(string); ok && v != "" {
+				ipv6Addr = v
+			}
+		}
+		if ipv6Addr != "" {
+			svc = codexauth.NewCodexAuth(e.cfg, ipv6Addr)
+		} else {
+			svc = codexauth.NewCodexAuth(e.cfg)
+		}
 		e.codexAuthCache.Store(auth.ID, svc)
 	}
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)

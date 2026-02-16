@@ -29,9 +29,11 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/gemini"
 	iflowauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/iflow"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kilo"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -274,8 +276,6 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		if entry == nil {
 			continue
 		}
-
-		// Filter by status (matches status_message or status, case-insensitive).
 		if filterStatus != "" {
 			sm, _ := entry["status_message"].(string)
 			st, _ := entry["status"].(string)
@@ -283,8 +283,6 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 				continue
 			}
 		}
-
-		// Filter by unavailable flag.
 		if filterUnavailable != "" {
 			ua, _ := entry["unavailable"].(bool)
 			if filterUnavailable == "true" && !ua {
@@ -294,15 +292,12 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 				continue
 			}
 		}
-
-		// Filter by provider (case-insensitive).
 		if filterProvider != "" {
 			prov, _ := entry["provider"].(string)
 			if !strings.EqualFold(prov, filterProvider) {
 				continue
 			}
 		}
-
 		files = append(files, entry)
 	}
 	sort.Slice(files, func(i, j int) bool {
@@ -1428,6 +1423,21 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		// Create token storage and persist
 		tokenStorage := openaiAuth.CreateTokenStorage(bundle)
 		fileName := codex.CredentialFileName(tokenStorage.Email, planType, hashAccountID, true)
+
+		// Assign a fixed IPv6 source address for this account if IPv6 prefix is configured
+		var assignedIPv6 string
+		if h.cfg.IPv6Prefix != "" {
+			if pool := config.GetIPv6Pool(h.cfg.IPv6Prefix); pool != nil {
+				if v6, errV6 := pool.Assign(fileName); errV6 == nil {
+					assignedIPv6 = v6
+					tokenStorage.IPv6 = v6
+					log.Infof("Assigned IPv6 %s to codex account %s", v6, fileName)
+				} else {
+					log.Warnf("Failed to assign IPv6 for codex account %s: %v", fileName, errV6)
+				}
+			}
+		}
+
 		record := &coreauth.Auth{
 			ID:       fileName,
 			Provider: "codex",
@@ -1437,6 +1447,9 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				"email":      tokenStorage.Email,
 				"account_id": tokenStorage.AccountID,
 			},
+		}
+		if assignedIPv6 != "" {
+			record.Metadata["ipv6"] = assignedIPv6
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
@@ -2768,4 +2781,89 @@ func generateKiroPKCE() (verifier, challenge string, err error) {
 	challenge = base64.RawURLEncoding.EncodeToString(h[:])
 
 	return verifier, challenge, nil
+}
+
+func (h *Handler) RequestKiloToken(c *gin.Context) {
+	ctx := context.Background()
+
+	fmt.Println("Initializing Kilo authentication...")
+
+	state := fmt.Sprintf("kil-%d", time.Now().UnixNano())
+	kilocodeAuth := kilo.NewKiloAuth()
+
+	resp, err := kilocodeAuth.InitiateDeviceFlow(ctx)
+	if err != nil {
+		log.Errorf("Failed to initiate device flow: %v", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to initiate device flow"})
+		return
+	}
+
+	RegisterOAuthSession(state, "kilo")
+
+	go func() {
+		fmt.Printf("Please visit %s and enter code: %s\n", resp.VerificationURL, resp.Code)
+
+		status, err := kilocodeAuth.PollForToken(ctx, resp.Code)
+		if err != nil {
+			SetOAuthSessionError(state, "Authentication failed")
+			fmt.Printf("Authentication failed: %v\n", err)
+			return
+		}
+
+		profile, err := kilocodeAuth.GetProfile(ctx, status.Token)
+		if err != nil {
+			log.Warnf("Failed to fetch profile: %v", err)
+			profile = &kilo.Profile{Email: status.UserEmail}
+		}
+
+		var orgID string
+		if len(profile.Orgs) > 0 {
+			orgID = profile.Orgs[0].ID
+		}
+
+		defaults, err := kilocodeAuth.GetDefaults(ctx, status.Token, orgID)
+		if err != nil {
+			defaults = &kilo.Defaults{}
+		}
+
+		ts := &kilo.KiloTokenStorage{
+			Token:          status.Token,
+			OrganizationID: orgID,
+			Model:          defaults.Model,
+			Email:          status.UserEmail,
+			Type:           "kilo",
+		}
+
+		fileName := kilo.CredentialFileName(status.UserEmail)
+		record := &coreauth.Auth{
+			ID:       fileName,
+			Provider: "kilo",
+			FileName: fileName,
+			Storage:  ts,
+			Metadata: map[string]any{
+				"email":           status.UserEmail,
+				"organization_id": orgID,
+				"model":          defaults.Model,
+			},
+		}
+
+		savedPath, errSave := h.saveTokenRecord(ctx, record)
+		if errSave != nil {
+			log.Errorf("Failed to save authentication tokens: %v", errSave)
+			SetOAuthSessionError(state, "Failed to save authentication tokens")
+			return
+		}
+
+		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
+		CompleteOAuthSession(state)
+		CompleteOAuthSessionsByProvider("kilo")
+	}()
+
+	c.JSON(200, gin.H{
+		"status":           "ok",
+		"url":              resp.VerificationURL,
+		"state":            state,
+		"user_code":        resp.Code,
+		"verification_uri": resp.VerificationURL,
+	})
 }

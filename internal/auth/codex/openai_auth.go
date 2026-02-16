@@ -9,9 +9,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
@@ -36,9 +38,55 @@ type CodexAuth struct {
 
 // NewCodexAuth creates a new CodexAuth service instance.
 // It initializes an HTTP client with proxy settings from the provided configuration.
-func NewCodexAuth(cfg *config.Config) *CodexAuth {
+// An optional IPv6 address can be passed to bind the HTTP client to a specific source address.
+func NewCodexAuth(cfg *config.Config, ipv6Addr ...string) *CodexAuth {
+	httpClient := &http.Client{}
+
+	// If an IPv6 source address is provided, create a transport with IPV6_FREEBIND
+	var boundIPv6 string
+	if len(ipv6Addr) > 0 {
+		boundIPv6 = strings.TrimSpace(ipv6Addr[0])
+	}
+	if boundIPv6 != "" {
+		srcIP := net.ParseIP(boundIPv6)
+		if srcIP != nil {
+			dialer := &net.Dialer{
+				LocalAddr: &net.TCPAddr{IP: srcIP},
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+				Control: func(network, address string, c syscall.RawConn) error {
+					var sErr error
+					if errCtrl := c.Control(func(fd uintptr) {
+						// IPV6_FREEBIND = 78 on Linux
+						sErr = syscall.SetsockoptInt(int(fd), syscall.SOL_IPV6, 78, 1)
+					}); errCtrl != nil {
+						return errCtrl
+					}
+					return sErr
+				},
+			}
+			transport := &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					conn, err := dialer.DialContext(ctx, "tcp6", addr)
+					if err != nil {
+						log.Warnf("IPv6 dial failed (codex auth): src=%s dst=%s err=%v", boundIPv6, addr, err)
+						return nil, err
+					}
+					log.Debugf("IPv6 dial ok (codex auth): src=%s dst=%s local=%s", boundIPv6, addr, conn.LocalAddr())
+					return conn, nil
+				},
+				MaxIdleConns:        100,
+				IdleConnTimeout:     90 * time.Second,
+				TLSHandshakeTimeout: 10 * time.Second,
+			}
+			httpClient.Transport = transport
+		}
+	}
+
+	httpClient = util.SetProxy(&cfg.SDKConfig, httpClient)
+
 	return &CodexAuth{
-		httpClient: util.SetProxy(&cfg.SDKConfig, &http.Client{Transport: &http.Transport{}}),
+		httpClient: httpClient,
 	}
 }
 

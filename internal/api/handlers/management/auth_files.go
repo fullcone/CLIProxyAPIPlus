@@ -261,38 +261,38 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		h.listAuthFilesFromDisk(c)
 		return
 	}
+	auths := h.authManager.List()
+	files := make([]gin.H, 0, len(auths))
 
 	// Optional query parameter filters
 	filterStatus := strings.TrimSpace(c.Query("status"))
 	filterUnavailable := strings.TrimSpace(c.Query("unavailable"))
 	filterProvider := strings.TrimSpace(c.Query("provider"))
 
-	auths := h.authManager.List()
-	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
-			// Filter by status (matches status_message or status field, case-insensitive)
+			// Apply status filter (matches status or status_message, case-insensitive)
 			if filterStatus != "" {
-				statusMsg, _ := entry["status_message"].(string)
-				status, _ := entry["status"].(string)
-				if !strings.EqualFold(statusMsg, filterStatus) && !strings.EqualFold(status, filterStatus) {
+				entryStatus, _ := entry["status"].(string)
+				entryStatusMsg, _ := entry["status_message"].(string)
+				if !strings.EqualFold(entryStatus, filterStatus) && !strings.EqualFold(entryStatusMsg, filterStatus) {
 					continue
 				}
 			}
-			// Filter by unavailable flag
+			// Apply unavailable filter
 			if filterUnavailable != "" {
-				unavailable, _ := entry["unavailable"].(bool)
-				if filterUnavailable == "true" && !unavailable {
+				entryUnavailable, _ := entry["unavailable"].(bool)
+				if filterUnavailable == "true" && !entryUnavailable {
 					continue
 				}
-				if filterUnavailable == "false" && unavailable {
+				if filterUnavailable == "false" && entryUnavailable {
 					continue
 				}
 			}
-			// Filter by provider (case-insensitive)
+			// Apply provider filter (case-insensitive)
 			if filterProvider != "" {
-				provider, _ := entry["provider"].(string)
-				if !strings.EqualFold(provider, filterProvider) {
+				entryProvider, _ := entry["provider"].(string)
+				if !strings.EqualFold(entryProvider, filterProvider) {
 					continue
 				}
 			}

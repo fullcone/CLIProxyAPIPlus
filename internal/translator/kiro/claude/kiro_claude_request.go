@@ -682,11 +682,9 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 				}
 				// Content fallback: if all tool_results were orphaned and removed,
 				// revert content from "Tool results provided." to "Continue"
-				if len(ctx.ToolResults) == 0 && h.UserInputMessage != nil &&
-					strings.TrimSpace(h.UserInputMessage.Content) == kirocommon.DefaultUserContentWithToolResults {
+				if len(ctx.ToolResults) == 0 && strings.TrimSpace(h.UserInputMessage.Content) == strings.TrimSpace(kirocommon.DefaultUserContentWithToolResults) {
 					h.UserInputMessage.Content = kirocommon.DefaultUserContent
-					log.Debugf("kiro: reverted history[%d] content from '%s' to '%s' after orphan removal",
-						i, kirocommon.DefaultUserContentWithToolResults, kirocommon.DefaultUserContent)
+					log.Debugf("kiro: history[%d] content reverted from DefaultUserContentWithToolResults to DefaultUserContent after orphan removal", i)
 				}
 			}
 		}
@@ -708,13 +706,11 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 		currentToolResults = filtered
 	}
 
-	// Content fallback for currentMessage: if all tool_results were orphaned and removed,
+	// Content fallback: if all currentToolResults were orphaned and removed,
 	// revert content from "Tool results provided." to "Continue"
-	if len(currentToolResults) == 0 && currentUserMsg != nil &&
-		strings.TrimSpace(currentUserMsg.Content) == kirocommon.DefaultUserContentWithToolResults {
+	if len(currentToolResults) == 0 && currentUserMsg != nil && strings.TrimSpace(currentUserMsg.Content) == strings.TrimSpace(kirocommon.DefaultUserContentWithToolResults) {
 		currentUserMsg.Content = kirocommon.DefaultUserContent
-		log.Debugf("kiro: reverted currentMessage content from '%s' to '%s' after orphan removal",
-			kirocommon.DefaultUserContentWithToolResults, kirocommon.DefaultUserContent)
+		log.Debugf("kiro: currentMessage content reverted from DefaultUserContentWithToolResults to DefaultUserContent after orphan removal")
 	}
 
 	return history, currentUserMsg, currentToolResults

@@ -1515,8 +1515,8 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool, provider string) (tim
 	if disableCooling {
 		return 0, prevLevel
 	}
-	// Kiro uses a shorter backoff cap (1 minute) to recover faster
-	if strings.EqualFold(provider, "kiro") {
+	// Kiro provider uses a shorter backoff cap (1 minute) since quota recovers faster.
+	if strings.EqualFold(strings.TrimSpace(provider), "kiro") {
 		cooldown := quotaBackoffBase * time.Duration(1<<prevLevel)
 		if cooldown < quotaBackoffBase {
 			cooldown = quotaBackoffBase

@@ -70,8 +70,8 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	}
 	httpClientCacheMutex.RUnlock()
 
-	// Create new client
-	httpClient := &http.Client{}
+	// Create new client with independent Transport to isolate connection pool per auth
+	httpClient := &http.Client{Transport: &http.Transport{}}
 	if timeout > 0 {
 		httpClient.Timeout = timeout
 	}

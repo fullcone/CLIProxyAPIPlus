@@ -681,7 +681,7 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 					h.UserInputMessage.UserInputMessageContext = nil
 				}
 				// Content fallback: if orphan filtering cleared all tool_results,
-				// the content placeholder "Tool results provided." is no longer accurate.
+				// the placeholder content "Tool results provided." is no longer accurate.
 				if len(ctx.ToolResults) == 0 && strings.TrimSpace(h.UserInputMessage.Content) == kirocommon.DefaultUserContentWithToolResults {
 					h.UserInputMessage.Content = kirocommon.DefaultUserContent
 					log.Debugf("kiro: history[%d] content fallback from DefaultUserContentWithToolResults to DefaultUserContent after orphan filtering", i)
@@ -706,8 +706,8 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 		currentToolResults = filtered
 	}
 
-	// Content fallback: if orphan filtering cleared all tool_results from currentMessage,
-	// the content placeholder "Tool results provided." is no longer accurate.
+	// Content fallback for currentMessage: if orphan filtering cleared all tool_results,
+	// the placeholder content "Tool results provided." is no longer accurate.
 	if currentUserMsg != nil && len(currentToolResults) == 0 && strings.TrimSpace(currentUserMsg.Content) == kirocommon.DefaultUserContentWithToolResults {
 		currentUserMsg.Content = kirocommon.DefaultUserContent
 		log.Debugf("kiro: currentMessage content fallback from DefaultUserContentWithToolResults to DefaultUserContent after orphan filtering")

@@ -274,6 +274,8 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		if entry == nil {
 			continue
 		}
+
+		// Filter by status (matches status_message or status, case-insensitive).
 		if filterStatus != "" {
 			sm, _ := entry["status_message"].(string)
 			st, _ := entry["status"].(string)
@@ -281,6 +283,8 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 				continue
 			}
 		}
+
+		// Filter by unavailable flag.
 		if filterUnavailable != "" {
 			ua, _ := entry["unavailable"].(bool)
 			if filterUnavailable == "true" && !ua {
@@ -290,12 +294,15 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 				continue
 			}
 		}
+
+		// Filter by provider (case-insensitive).
 		if filterProvider != "" {
-			p, _ := entry["provider"].(string)
-			if !strings.EqualFold(p, filterProvider) {
+			prov, _ := entry["provider"].(string)
+			if !strings.EqualFold(prov, filterProvider) {
 				continue
 			}
 		}
+
 		files = append(files, entry)
 	}
 	sort.Slice(files, func(i, j int) bool {
@@ -1443,7 +1450,6 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		}
 		fmt.Println("You can now use Codex services through this CLI")
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("codex")
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})

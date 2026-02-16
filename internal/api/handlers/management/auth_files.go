@@ -262,42 +262,41 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return
 	}
 	auths := h.authManager.List()
-	files := make([]gin.H, 0, len(auths))
 
-	// Optional query parameter filters
+	// Optional query filters.
 	filterStatus := strings.TrimSpace(c.Query("status"))
 	filterUnavailable := strings.TrimSpace(c.Query("unavailable"))
 	filterProvider := strings.TrimSpace(c.Query("provider"))
 
+	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
-		if entry := h.buildAuthFileEntry(auth); entry != nil {
-			// Apply status filter (matches status or status_message, case-insensitive)
-			if filterStatus != "" {
-				entryStatus, _ := entry["status"].(string)
-				entryStatusMsg, _ := entry["status_message"].(string)
-				if !strings.EqualFold(entryStatus, filterStatus) && !strings.EqualFold(entryStatusMsg, filterStatus) {
-					continue
-				}
-			}
-			// Apply unavailable filter
-			if filterUnavailable != "" {
-				entryUnavailable, _ := entry["unavailable"].(bool)
-				if filterUnavailable == "true" && !entryUnavailable {
-					continue
-				}
-				if filterUnavailable == "false" && entryUnavailable {
-					continue
-				}
-			}
-			// Apply provider filter (case-insensitive)
-			if filterProvider != "" {
-				entryProvider, _ := entry["provider"].(string)
-				if !strings.EqualFold(entryProvider, filterProvider) {
-					continue
-				}
-			}
-			files = append(files, entry)
+		entry := h.buildAuthFileEntry(auth)
+		if entry == nil {
+			continue
 		}
+		if filterStatus != "" {
+			sm, _ := entry["status_message"].(string)
+			st, _ := entry["status"].(string)
+			if !strings.EqualFold(sm, filterStatus) && !strings.EqualFold(st, filterStatus) {
+				continue
+			}
+		}
+		if filterUnavailable != "" {
+			ua, _ := entry["unavailable"].(bool)
+			if filterUnavailable == "true" && !ua {
+				continue
+			}
+			if filterUnavailable == "false" && ua {
+				continue
+			}
+		}
+		if filterProvider != "" {
+			prov, _ := entry["provider"].(string)
+			if !strings.EqualFold(prov, filterProvider) {
+				continue
+			}
+		}
+		files = append(files, entry)
 	}
 	sort.Slice(files, func(i, j int) bool {
 		nameI, _ := files[i]["name"].(string)

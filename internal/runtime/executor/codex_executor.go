@@ -39,7 +39,7 @@ var dataTag = []byte("data:")
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type CodexExecutor struct {
 	cfg            *config.Config
-	codexAuthCache sync.Map // key: auth.ID (string), value: *codexauth.CodexAuth
+	codexAuthCache sync.Map // key: auth.ID (string) → value: *codexauth.CodexAuth
 }
 
 func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor{cfg: cfg} }

@@ -12,36 +12,33 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// permanentErrorPatterns defines substrings in LastError.Message that indicate
-// a Codex OAuth token is permanently invalid and will never recover.
-var permanentErrorPatterns = [][]string{
+// permanentErrorPatterns defines substrings that indicate a permanently invalid Codex token.
+// Each entry is a pair: both substrings must appear in LastError.Message.
+var permanentErrorPatterns = [][2]string{
 	{"token refresh failed", "invalid_grant"},
 	{"token refresh failed", "status 403"},
 	{"token refresh failed", "status 401"},
-	{"token has been invalidated"},
-	{"token is expired"},
+	{"token has been invalidated", ""},
+	{"token is expired", ""},
 }
 
-// codex cleanup configuration constants
 const (
 	codexCleanupInitialDelay = 30 * time.Second
 	codexCleanupInterval     = 5 * time.Minute
 	codexCleanupThreshold    = 3
-	codexRefreshOKWindow     = 10 * time.Minute
 )
 
-// package-level lifetime statistics
+// Package-level lifetime counters.
 var (
-	lifetimeRounds       int
-	lifetimeTotalDeleted int
-	lifetimeTotalRecover int
-	lifetimeMu           sync.Mutex
+	lifetimeRounds              int
+	lifetimeTotalAutoDeleted    int
+	lifetimeTotalRecovered      int
+	lifetimeTotalDisabledCleaned int
 )
 
 var codexCleanupOnce sync.Once
 
-// StartCodexCleanup launches the background goroutine that periodically scans
-// Codex OAuth accounts and auto-deletes permanently invalid ones.
+// StartCodexCleanup launches the background Codex account cleanup goroutine.
 // It is safe to call multiple times; only the first invocation starts the loop.
 func (h *Handler) StartCodexCleanup(ctx context.Context) {
 	codexCleanupOnce.Do(func() {
@@ -50,38 +47,42 @@ func (h *Handler) StartCodexCleanup(ctx context.Context) {
 }
 
 func (h *Handler) codexCleanupLoop(ctx context.Context) {
+	// Wait for auth manager to finish loading.
+	select {
+	case <-time.After(codexCleanupInitialDelay):
+	case <-ctx.Done():
+		return
+	}
+
 	// invalidCounts tracks consecutive permanent-error detections per auth ID.
 	invalidCounts := make(map[string]int)
 
-	// Wait for auth manager to finish loading.
-	select {
-	case <-ctx.Done():
-		return
-	case <-time.After(codexCleanupInitialDelay):
-	}
+	// Run first scan immediately, then on ticker.
+	h.codexCleanupRound(ctx, invalidCounts)
 
 	ticker := time.NewTicker(codexCleanupInterval)
 	defer ticker.Stop()
 
 	for {
-		h.runCodexCleanupRound(ctx, invalidCounts)
-
 		select {
+		case <-ticker.C:
+			h.codexCleanupRound(ctx, invalidCounts)
 		case <-ctx.Done():
 			return
-		case <-ticker.C:
 		}
 	}
 }
 
-func (h *Handler) runCodexCleanupRound(ctx context.Context, invalidCounts map[string]int) {
-	if h.authManager == nil {
+func (h *Handler) codexCleanupRound(ctx context.Context, invalidCounts map[string]int) {
+	if h == nil || h.authManager == nil {
 		return
 	}
 
+	lifetimeRounds++
+
 	allAuths := h.authManager.List()
 
-	// Filter codex accounts only.
+	// Collect codex accounts only.
 	var codexAuths []*coreauth.Auth
 	for _, a := range allAuths {
 		if strings.ToLower(a.Provider) == "codex" {
@@ -89,181 +90,150 @@ func (h *Handler) runCodexCleanupRound(ctx context.Context, invalidCounts map[st
 		}
 	}
 
-	if len(codexAuths) == 0 {
-		return
-	}
-
-	log.Debugf("codex cleanup: scanning %d codex accounts", len(codexAuths))
-
-	now := time.Now()
+	total := len(codexAuths)
+	log.Debugf("codex cleanup: scanning %d codex accounts", total)
 
 	// Per-round statistics.
 	var (
-		statActive        int
-		statRefreshOK     int
-		statError         int
-		statQuotaExceeded int
-		statDisabled      int
+		statActive          int
+		statRefreshOK       int
+		statError           int
+		statQuotaExceeded   int
+		statDisabled        int
+		statDisabledCleaned int
 	)
 
-	// Track which IDs are still present this round for counter cleanup.
-	seenIDs := make(map[string]struct{}, len(codexAuths))
+	// Track which IDs are still permanently invalid this round.
+	currentInvalid := make(map[string]bool)
+	var autoDeleted int
+	var newInvalid, knownInvalid int
 
-	var (
-		newInvalid   int
-		knownInvalid int
-		autoDeleted  int
-		recovered    int
-	)
+	now := time.Now()
 
-	for _, a := range codexAuths {
-		id := a.ID
-		seenIDs[id] = struct{}{}
+	for _, auth := range codexAuths {
+		_, email := auth.AccountInfo()
 
-		// Gather summary stats.
-		if a.Disabled {
+		// --- Disabled accounts: clean residual files ---
+		if auth.Disabled {
 			statDisabled++
+			cleaned := false
+			if auth.FileName != "" {
+				full := filepath.Join(h.cfg.AuthDir, filepath.Base(auth.FileName))
+				if err := os.Remove(full); err == nil {
+					cleaned = true
+				}
+			}
+			if err := h.deleteTokenRecord(ctx, auth.FileName); err == nil {
+				cleaned = true
+			}
+			if cleaned {
+				statDisabledCleaned++
+				lifetimeTotalDisabledCleaned++
+				log.Infof("codex cleanup: cleaned disabled account %s (%s) — removed file and token record", auth.ID, email)
+			}
+			continue
 		}
-		if a.Quota.Exceeded {
-			statQuotaExceeded++
-		}
-		if a.Status == coreauth.StatusActive {
+
+		// Count active.
+		if auth.Status == coreauth.StatusActive {
 			statActive++
-			if !a.LastRefreshedAt.IsZero() && now.Sub(a.LastRefreshedAt) <= codexRefreshOKWindow {
+			if !auth.LastRefreshedAt.IsZero() && now.Sub(auth.LastRefreshedAt) <= 10*time.Minute {
 				statRefreshOK++
 			}
 		}
-		if a.Status == coreauth.StatusError {
-			statError++
-		}
 
-		// Skip accounts that are disabled or quota-exceeded.
-		if a.Disabled || a.Quota.Exceeded {
+		// Skip quota-exceeded.
+		if auth.Quota.Exceeded {
+			statQuotaExceeded++
 			continue
 		}
 
-		// Only inspect accounts in error state with a last error.
-		if a.Status != coreauth.StatusError || a.LastError == nil {
-			// If this account was previously counted, it has recovered.
-			if prev, ok := invalidCounts[id]; ok && prev > 0 {
-				_, email := a.AccountInfo()
-				log.Infof("codex cleanup: %s (%s) recovered, resetting counter", id, email)
-				delete(invalidCounts, id)
-				recovered++
+		// Only inspect error-state accounts.
+		if auth.Status != coreauth.StatusError || auth.LastError == nil {
+			// If this account was previously tracked, it recovered.
+			if prev, ok := invalidCounts[auth.ID]; ok && prev > 0 {
+				log.Infof("codex cleanup: %s (%s) recovered, resetting counter", auth.ID, email)
+				delete(invalidCounts, auth.ID)
+				lifetimeTotalRecovered++
 			}
 			continue
 		}
 
-		// Check if the error message matches any permanent error pattern.
-		reason := matchPermanentError(a.LastError.Message)
-		if reason == "" {
-			// Error present but not a permanent pattern — reset if previously counted.
-			if prev, ok := invalidCounts[id]; ok && prev > 0 {
-				_, email := a.AccountInfo()
-				log.Infof("codex cleanup: %s (%s) recovered, resetting counter", id, email)
-				delete(invalidCounts, id)
-				recovered++
+		statError++
+
+		msg := strings.ToLower(auth.LastError.Message)
+		if !isPermanentCodexError(msg) {
+			// Was tracked before but no longer matches — recovered.
+			if prev, ok := invalidCounts[auth.ID]; ok && prev > 0 {
+				log.Infof("codex cleanup: %s (%s) recovered, resetting counter", auth.ID, email)
+				delete(invalidCounts, auth.ID)
+				lifetimeTotalRecovered++
 			}
 			continue
 		}
 
-		// Increment consecutive invalid count.
-		invalidCounts[id]++
-		count := invalidCounts[id]
-		_, email := a.AccountInfo()
+		// Permanent error detected — increment counter.
+		invalidCounts[auth.ID]++
+		count := invalidCounts[auth.ID]
+		currentInvalid[auth.ID] = true
 
 		if count >= codexCleanupThreshold {
 			// Auto-delete.
-			log.Warnf("codex cleanup: auto-deleted %s (%s) after %d consecutive checks — reason: %s", id, email, codexCleanupThreshold, reason)
-			h.performCodexDelete(ctx, a)
-			delete(invalidCounts, id)
+			reason := auth.LastError.Message
+			if auth.FileName != "" {
+				full := filepath.Join(h.cfg.AuthDir, filepath.Base(auth.FileName))
+				_ = os.Remove(full)
+			}
+			_ = h.deleteTokenRecord(ctx, auth.FileName)
+			h.disableAuth(ctx, auth.ID)
+			delete(invalidCounts, auth.ID)
 			autoDeleted++
+			lifetimeTotalAutoDeleted++
+			log.Warnf("codex cleanup: auto-deleted %s (%s) after %d consecutive checks — reason: %s", auth.ID, email, codexCleanupThreshold, reason)
 		} else {
-			log.Debugf("codex cleanup: %s (%s) invalid count %d/%d — reason: %s", id, email, count, codexCleanupThreshold, reason)
 			if count == 1 {
 				newInvalid++
 			} else {
 				knownInvalid++
 			}
+			log.Debugf("codex cleanup: %s (%s) invalid count %d/%d — reason: %s", auth.ID, email, count, codexCleanupThreshold, auth.LastError.Message)
 		}
 	}
 
-	// Clean up counters for IDs that disappeared (e.g. manually deleted).
-	for id := range invalidCounts {
-		if _, ok := seenIDs[id]; !ok {
+	// Purge stale entries for IDs no longer in the codex list.
+	for id, cnt := range invalidCounts {
+		if cnt > 0 && !currentInvalid[id] {
+			// Account disappeared from list (already deleted externally or provider changed).
 			delete(invalidCounts, id)
 		}
 	}
 
-	// Update lifetime stats.
-	lifetimeMu.Lock()
-	lifetimeRounds++
-	lifetimeTotalDeleted += autoDeleted
-	lifetimeTotalRecover += recovered
-	rounds := lifetimeRounds
-	totalDel := lifetimeTotalDeleted
-	totalRec := lifetimeTotalRecover
-	lifetimeMu.Unlock()
-
-	totalInvalid := newInvalid + knownInvalid
-	if totalInvalid > 0 || autoDeleted > 0 || recovered > 0 {
-		log.Infof("codex cleanup done: %d permanently invalid (%d new, %d known), %d auto-deleted", totalInvalid, newInvalid, knownInvalid, autoDeleted)
+	permanentlyInvalid := newInvalid + knownInvalid
+	if permanentlyInvalid > 0 || autoDeleted > 0 {
+		log.Infof("codex cleanup done: %d permanently invalid (%d new, %d known), %d auto-deleted", permanentlyInvalid, newInvalid, knownInvalid, autoDeleted)
 	}
 
-	log.Infof("codex cleanup summary: total=%d, active=%d, refreshOK=%d, error=%d, quotaExceeded=%d, disabled=%d",
-		len(codexAuths), statActive, statRefreshOK, statError, statQuotaExceeded, statDisabled)
+	log.Infof("codex cleanup summary: total=%d, active=%d, refreshOK=%d, error=%d, quotaExceeded=%d, disabled=%d, disabledCleaned=%d",
+		total, statActive, statRefreshOK, statError, statQuotaExceeded, statDisabled, statDisabledCleaned)
 
-	log.Infof("codex cleanup lifetime: rounds=%d, totalAutoDeleted=%d, totalRecovered=%d",
-		rounds, totalDel, totalRec)
+	log.Infof("codex cleanup lifetime: rounds=%d, totalAutoDeleted=%d, totalRecovered=%d, totalDisabledCleaned=%d",
+		lifetimeRounds, lifetimeTotalAutoDeleted, lifetimeTotalRecovered, lifetimeTotalDisabledCleaned)
 }
 
-// performCodexDelete removes the auth file from disk, deletes the token record,
-// and disables the auth entry in the manager.
-func (h *Handler) performCodexDelete(ctx context.Context, a *coreauth.Auth) {
-	if a == nil {
-		return
-	}
-
-	// Remove the auth file from disk.
-	if a.FileName != "" {
-		filePath := a.FileName
-		if !filepath.IsAbs(filePath) && h.cfg != nil && h.cfg.AuthDir != "" {
-			filePath = filepath.Join(h.cfg.AuthDir, filePath)
-		}
-		if err := os.Remove(filePath); err != nil && !os.IsNotExist(err) {
-			log.Warnf("codex cleanup: failed to remove file %s: %v", filePath, err)
-		}
-	}
-
-	// Delete the token record from the store.
-	if a.FileName != "" {
-		if err := h.deleteTokenRecord(ctx, a.FileName); err != nil {
-			log.Warnf("codex cleanup: failed to delete token record for %s: %v", a.ID, err)
-		}
-	}
-
-	// Disable the auth entry in the manager.
-	h.disableAuth(ctx, a.ID)
-}
-
-// matchPermanentError checks if msg matches any permanent error pattern.
-// Returns the matched reason string, or empty if no match.
-func matchPermanentError(msg string) string {
-	if msg == "" {
-		return ""
-	}
-	lower := strings.ToLower(msg)
-	for _, parts := range permanentErrorPatterns {
-		matched := true
-		for _, p := range parts {
-			if !strings.Contains(lower, strings.ToLower(p)) {
-				matched = false
-				break
+// isPermanentCodexError checks whether the lowercased error message matches
+// any of the known permanent failure patterns.
+func isPermanentCodexError(msg string) bool {
+	for _, pat := range permanentErrorPatterns {
+		if pat[1] == "" {
+			// Single-substring match.
+			if strings.Contains(msg, pat[0]) {
+				return true
+			}
+		} else {
+			if strings.Contains(msg, pat[0]) && strings.Contains(msg, pat[1]) {
+				return true
 			}
 		}
-		if matched {
-			return msg
-		}
 	}
-	return ""
+	return false
 }

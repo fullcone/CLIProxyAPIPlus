@@ -264,9 +264,9 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	auths := h.authManager.List()
 
 	// Optional query filters.
-	qStatus := strings.TrimSpace(c.Query("status"))
-	qUnavailable := strings.TrimSpace(c.Query("unavailable"))
-	qProvider := strings.TrimSpace(c.Query("provider"))
+	filterStatus := strings.TrimSpace(c.Query("status"))
+	filterUnavailable := strings.TrimSpace(c.Query("unavailable"))
+	filterProvider := strings.TrimSpace(c.Query("provider"))
 
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
@@ -274,25 +274,25 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		if entry == nil {
 			continue
 		}
-		if qStatus != "" {
+		if filterStatus != "" {
 			sm, _ := entry["status_message"].(string)
 			st, _ := entry["status"].(string)
-			if !strings.EqualFold(sm, qStatus) && !strings.EqualFold(st, qStatus) {
+			if !strings.EqualFold(sm, filterStatus) && !strings.EqualFold(st, filterStatus) {
 				continue
 			}
 		}
-		if qUnavailable != "" {
+		if filterUnavailable != "" {
 			ua, _ := entry["unavailable"].(bool)
-			if qUnavailable == "true" && !ua {
+			if filterUnavailable == "true" && !ua {
 				continue
 			}
-			if qUnavailable == "false" && ua {
+			if filterUnavailable == "false" && ua {
 				continue
 			}
 		}
-		if qProvider != "" {
-			pv, _ := entry["provider"].(string)
-			if !strings.EqualFold(pv, qProvider) {
+		if filterProvider != "" {
+			p, _ := entry["provider"].(string)
+			if !strings.EqualFold(p, filterProvider) {
 				continue
 			}
 		}

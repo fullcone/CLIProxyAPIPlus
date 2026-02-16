@@ -263,7 +263,7 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 	}
 	auths := h.authManager.List()
 
-	// Optional query filters.
+	// Optional query filters
 	filterStatus := strings.TrimSpace(c.Query("status"))
 	filterUnavailable := strings.TrimSpace(c.Query("unavailable"))
 	filterProvider := strings.TrimSpace(c.Query("provider"))

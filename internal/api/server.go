@@ -657,8 +657,6 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 	}
-
-	s.mgmt.StartCodexCleanup(context.Background())
 }
 
 func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {

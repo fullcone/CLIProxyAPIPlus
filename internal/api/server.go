@@ -660,65 +660,103 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 	}
 
-	// Backfill IPv6 addresses for existing Codex accounts before cleanup starts
-	if strings.TrimSpace(s.cfg.IPv6Prefix) != "" {
-		pool := config.GetIPv6Pool(s.cfg.IPv6Prefix)
-		if pool != nil && s.mgmt != nil {
-			go func() {
-				authMgr := s.handlers.AuthManager
-				if authMgr == nil {
-					return
-				}
-				auths := authMgr.List()
-
-				// Pass 1: Register existing IPv6 assignments to prevent collisions
-				for _, a := range auths {
-					if a.Provider != "codex" || a.Metadata == nil {
-						continue
-					}
-					if ipv6, ok := a.Metadata["ipv6"].(string); ok && strings.TrimSpace(ipv6) != "" {
-						pool.Register(a.ID, strings.TrimSpace(ipv6))
-					}
-				}
-
-				// Pass 2: Assign IPv6 to accounts that don't have one yet
-				tokenStore := sdkAuth.GetTokenStore()
-				if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok {
-					dirSetter.SetBaseDir(s.cfg.AuthDir)
-				}
-				for _, a := range auths {
-					if a.Provider != "codex" || a.Metadata == nil {
-						continue
-					}
-					if ipv6, ok := a.Metadata["ipv6"].(string); ok && strings.TrimSpace(ipv6) != "" {
-						continue // already has IPv6
-					}
-					addr, err := pool.Assign(a.ID)
-					if err != nil {
-						log.Warnf("IPv6 backfill: failed to assign for %s: %v", a.ID, err)
-						continue
-					}
-					a.Metadata["ipv6"] = addr
-
-					// Update the persisted auth file: read JSON, add ipv6 field, write back
-					authDir := s.cfg.AuthDir
-					filePath := filepath.Join(authDir, a.FileName+".json")
-					if raw, errRead := os.ReadFile(filePath); errRead == nil {
-						var obj map[string]any
-						if errJSON := json.Unmarshal(raw, &obj); errJSON == nil {
-							obj["ipv6"] = addr
-							if updated, errMarshal := json.MarshalIndent(obj, "", "  "); errMarshal == nil {
-								_ = os.WriteFile(filePath, append(updated, '\n'), 0600)
-							}
-						}
-					}
-					log.Infof("IPv6 backfill: assigned %s to codex account %s", addr, a.ID)
-				}
-			}()
-		}
+	// Backfill IPv6 addresses for existing Codex accounts that don't have one yet
+	if s.cfg != nil && s.cfg.IPv6Prefix != "" {
+		go s.backfillCodexIPv6()
 	}
 
 	s.mgmt.StartCodexCleanup(context.Background())
+}
+
+// backfillCodexIPv6 assigns IPv6 addresses to existing Codex accounts that don't have one.
+// It runs two passes: first registers already-assigned addresses, then allocates new ones.
+func (s *Server) backfillCodexIPv6() {
+	if s == nil || s.cfg == nil || s.cfg.IPv6Prefix == "" {
+		return
+	}
+
+	// Wait for auth manager to finish loading
+	time.Sleep(5 * time.Second)
+
+	pool := config.GetIPv6Pool(s.cfg.IPv6Prefix)
+	if pool == nil {
+		log.Warn("ipv6 backfill: pool not initialized")
+		return
+	}
+
+	if s.handlers == nil || s.handlers.AuthManager == nil {
+		log.Warn("ipv6 backfill: auth manager not available")
+		return
+	}
+
+	allAuths := s.handlers.AuthManager.List()
+
+	// Pass 1: Register existing IPv6 assignments to prevent conflicts
+	for _, a := range allAuths {
+		if strings.ToLower(a.Provider) != "codex" {
+			continue
+		}
+		if a.Metadata == nil {
+			continue
+		}
+		if ipv6, ok := a.Metadata["ipv6"].(string); ok && ipv6 != "" {
+			pool.Register(a.ID, ipv6)
+		}
+	}
+
+	// Pass 2: Assign new IPv6 addresses to accounts without one
+	tokenStore := sdkAuth.GetTokenStore()
+	if dirSetter, ok := tokenStore.(interface{ SetBaseDir(string) }); ok {
+		dirSetter.SetBaseDir(s.cfg.AuthDir)
+	}
+
+	for _, a := range allAuths {
+		if strings.ToLower(a.Provider) != "codex" {
+			continue
+		}
+		// Skip if already has IPv6
+		if a.Metadata != nil {
+			if ipv6, ok := a.Metadata["ipv6"].(string); ok && ipv6 != "" {
+				continue
+			}
+		}
+
+		// Assign new IPv6
+		addr, err := pool.Assign(a.ID)
+		if err != nil {
+			log.Warnf("ipv6 backfill: failed to assign IPv6 for %s: %v", a.ID, err)
+			continue
+		}
+
+		// Update in-memory metadata
+		if a.Metadata == nil {
+			a.Metadata = make(map[string]any)
+		}
+		a.Metadata["ipv6"] = addr
+
+		// Update the persisted auth file: read JSON, add ipv6 field, write back
+		fileName := strings.TrimSpace(a.FileName)
+		if fileName == "" {
+			fileName = strings.TrimSpace(a.ID)
+		}
+		if fileName != "" {
+			filePath := fileName
+			if !filepath.IsAbs(filePath) {
+				filePath = filepath.Join(s.cfg.AuthDir, filePath)
+			}
+			if data, errRead := os.ReadFile(filePath); errRead == nil {
+				var raw map[string]any
+				if errJSON := json.Unmarshal(data, &raw); errJSON == nil {
+					raw["ipv6"] = addr
+					if updated, errMarshal := json.MarshalIndent(raw, "", "  "); errMarshal == nil {
+						_ = os.WriteFile(filePath, append(updated, '\n'), 0600)
+					}
+				}
+			}
+		}
+
+		log.Infof("ipv6 backfill: assigned %s to codex account %s", addr, a.ID)
+	}
 }
 
 func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {

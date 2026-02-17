@@ -50,9 +50,9 @@ const (
 	refreshCheckInterval  = 30 * time.Second
 	refreshPendingBackoff = time.Minute
 	refreshFailureBackoff = 1 * time.Minute
-	quotaBackoffBase      = time.Second
-	quotaBackoffMax       = 30 * time.Minute
-	kiroQuotaBackoffMax   = 1 * time.Minute
+	quotaBackoffBase       = time.Second
+	quotaBackoffMax        = 30 * time.Minute
+	kiroQuotaBackoffMax    = 1 * time.Minute
 )
 
 var quotaCooldownDisabled atomic.Bool

@@ -12,8 +12,8 @@ import (
 type IPv6Pool struct {
 	mu      sync.Mutex
 	network *net.IPNet
-	prefix  net.IP // 16-byte canonical prefix
-	ones    int    // prefix length in bits
+	prefix  net.IP
+	ones    int // prefix length in bits
 
 	forward map[string]string // authID -> IPv6 string
 	reverse map[string]string // IPv6 string -> authID
@@ -24,16 +24,16 @@ var (
 	ipv6PoolInstance *IPv6Pool
 )
 
-// GetIPv6Pool returns the global IPv6Pool singleton. If cidr is empty, returns nil.
-// The pool is initialized once; subsequent calls ignore the cidr parameter.
+// GetIPv6Pool returns the global IPv6Pool singleton.
+// If cidr is empty, returns nil. Initialised once; subsequent calls ignore cidr.
 func GetIPv6Pool(cidr string) *IPv6Pool {
 	if cidr == "" {
-		return ipv6PoolInstance
+		return ipv6PoolInstance // may be nil
 	}
 	ipv6PoolOnce.Do(func() {
 		pool, err := newIPv6Pool(cidr)
 		if err != nil {
-			fmt.Printf("WARNING: failed to initialize IPv6 pool from %q: %v\n", cidr, err)
+			fmt.Printf("ipv6 pool init error: %v\n", err)
 			return
 		}
 		ipv6PoolInstance = pool
@@ -44,15 +44,16 @@ func GetIPv6Pool(cidr string) *IPv6Pool {
 func newIPv6Pool(cidr string) (*IPv6Pool, error) {
 	ip, ipNet, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return nil, fmt.Errorf("parse CIDR %q: %w", cidr, err)
+		return nil, fmt.Errorf("invalid IPv6 CIDR %q: %w", cidr, err)
 	}
-	if ip.To16() == nil || ip.To4() != nil {
-		return nil, fmt.Errorf("%q is not an IPv6 address", cidr)
+	ones, bits := ipNet.Mask.Size()
+	if bits != 128 {
+		return nil, fmt.Errorf("expected IPv6 CIDR, got %d-bit network", bits)
 	}
-	ones, _ := ipNet.Mask.Size()
-	prefix := make(net.IP, 16)
-	copy(prefix, ipNet.IP.To16())
-
+	prefix := ip.To16()
+	if prefix == nil {
+		prefix = ipNet.IP.To16()
+	}
 	return &IPv6Pool{
 		network: ipNet,
 		prefix:  prefix,
@@ -62,7 +63,7 @@ func newIPv6Pool(cidr string) (*IPv6Pool, error) {
 	}, nil
 }
 
-// Assign returns the IPv6 address for authID. If not yet assigned, generates a new unique one.
+// Assign returns the IPv6 address for authID, allocating a new one if needed.
 func (p *IPv6Pool) Assign(authID string) (string, error) {
 	if p == nil {
 		return "", fmt.Errorf("ipv6 pool is nil")
@@ -73,18 +74,12 @@ func (p *IPv6Pool) Assign(authID string) (string, error) {
 	if addr, ok := p.forward[authID]; ok {
 		return addr, nil
 	}
-	addr, err := p.generateUnique()
-	if err != nil {
-		return "", err
-	}
-	p.forward[authID] = addr
-	p.reverse[addr] = authID
-	return addr, nil
+	return p.generateUnique(authID)
 }
 
-// Register records an existing authID -> IPv6 mapping (used at startup to reload persisted assignments).
+// Register records an existing authID -> IPv6 mapping (used at startup for persisted accounts).
 func (p *IPv6Pool) Register(authID, ipv6 string) {
-	if p == nil {
+	if p == nil || authID == "" || ipv6 == "" {
 		return
 	}
 	p.mu.Lock()
@@ -93,9 +88,9 @@ func (p *IPv6Pool) Register(authID, ipv6 string) {
 	p.reverse[ipv6] = authID
 }
 
-// Unregister removes the mapping for authID, freeing the address for reuse.
+// Unregister removes the mapping for authID (used when swapping temp ID for permanent ID).
 func (p *IPv6Pool) Unregister(authID string) {
-	if p == nil {
+	if p == nil || authID == "" {
 		return
 	}
 	p.mu.Lock()
@@ -116,39 +111,54 @@ func (p *IPv6Pool) Get(authID string) string {
 	return p.forward[authID]
 }
 
-// generateUnique creates a random IPv6 within the pool's network that is not yet assigned.
-// Caller must hold p.mu.
-func (p *IPv6Pool) generateUnique() (string, error) {
-	buf := make([]byte, 16)
+// generateUnique creates a random IPv6 within the prefix that is not yet allocated.
+// Must be called with p.mu held.
+func (p *IPv6Pool) generateUnique(authID string) (string, error) {
+	prefixBytes := len(p.network.Mask) // 16
 	for attempts := 0; attempts < 1000; attempts++ {
-		// Start from the prefix
-		copy(buf, p.prefix)
+		addr := make(net.IP, prefixBytes)
+		copy(addr, p.prefix)
 
 		// Fill random bytes for the host portion
-		randBytes := make([]byte, 16)
-		if _, err := rand.Read(randBytes); err != nil {
+		randomBytes := make([]byte, prefixBytes)
+		if _, err := rand.Read(randomBytes); err != nil {
 			return "", fmt.Errorf("crypto/rand failed: %w", err)
 		}
 
-		// Merge: keep prefix bits, randomize host bits
-		for i := 0; i < 16; i++ {
+		// Apply: keep prefix bits from p.prefix, fill suffix bits from random
+		for i := 0; i < prefixBytes; i++ {
 			maskByte := p.network.Mask[i]
-			buf[i] = (p.prefix[i] & maskByte) | (randBytes[i] & ^maskByte)
+			addr[i] = (p.prefix[i] & maskByte) | (randomBytes[i] & ^maskByte)
 		}
 
-		// Exclude addresses where the lower 64 bits represent a value <= 200
-		// i.e., bytes [8..14] are all zero and byte[15] <= 200
-		if buf[8] == 0 && buf[9] == 0 && buf[10] == 0 && buf[11] == 0 &&
-			buf[12] == 0 && buf[13] == 0 && buf[14] == 0 && buf[15] <= 200 {
+		// Exclude low-value addresses that may conflict with gateway/primary
+		if isLowAddress(addr) {
 			continue
 		}
 
-		ip := net.IP(buf)
-		addr := ip.String()
-		if _, taken := p.reverse[addr]; taken {
+		addrStr := addr.String()
+		if _, taken := p.reverse[addrStr]; taken {
 			continue
 		}
-		return addr, nil
+
+		p.forward[authID] = addrStr
+		p.reverse[addrStr] = authID
+		return addrStr, nil
 	}
 	return "", fmt.Errorf("failed to generate unique IPv6 after 1000 attempts")
+}
+
+// isLowAddress returns true if bytes [8..14] are all zero and byte[15] <= 200.
+// These addresses (like ::1, ::2, ::c8) may conflict with gateway/primary addresses.
+func isLowAddress(ip net.IP) bool {
+	ip = ip.To16()
+	if ip == nil {
+		return false
+	}
+	for i := 8; i <= 14; i++ {
+		if ip[i] != 0 {
+			return false
+		}
+	}
+	return ip[15] <= 200
 }

@@ -16,6 +16,10 @@ import (
 	"golang.org/x/net/proxy"
 )
 
+// IPV6_FREEBIND allows binding to an IPv6 address not assigned to a local interface.
+// Linux kernel constant, not exported by syscall package.
+const IPV6_FREEBIND = 78
+
 // httpClientCache caches HTTP clients by proxy URL to enable connection reuse
 var (
 	httpClientCache      = make(map[string]*http.Client)
@@ -41,75 +45,9 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	// Check for IPv6 source address binding (Codex accounts only)
 	var ipv6Addr string
 	if auth != nil && auth.Metadata != nil {
-		if v, ok := auth.Metadata["ipv6"].(string); ok {
-			ipv6Addr = strings.TrimSpace(v)
+		if v, ok := auth.Metadata["ipv6"].(string); ok && v != "" {
+			ipv6Addr = v
 		}
-	}
-
-	// If IPv6 source address is configured, create a client with IP_FREEBIND + LocalAddr
-	if ipv6Addr != "" {
-		var authID string
-		if auth != nil {
-			authID = auth.ID
-		}
-		var proxyURL string
-		if auth != nil {
-			proxyURL = strings.TrimSpace(auth.ProxyURL)
-		}
-		if proxyURL == "" && cfg != nil {
-			proxyURL = strings.TrimSpace(cfg.ProxyURL)
-		}
-		cacheKey := "ipv6|" + ipv6Addr + "|" + proxyURL + "|" + authID
-
-		httpClientCacheMutex.RLock()
-		if cachedClient, ok := httpClientCache[cacheKey]; ok {
-			httpClientCacheMutex.RUnlock()
-			if timeout > 0 {
-				return &http.Client{
-					Transport: cachedClient.Transport,
-					Timeout:   timeout,
-				}
-			}
-			return cachedClient
-		}
-		httpClientCacheMutex.RUnlock()
-
-		srcIP := net.ParseIP(ipv6Addr)
-		localAddr := &net.TCPAddr{IP: srcIP}
-		dialer := &net.Dialer{
-			LocalAddr: localAddr,
-			Timeout:   30 * time.Second,
-			KeepAlive: 30 * time.Second,
-			Control: func(network, address string, c syscall.RawConn) error {
-				var sErr error
-				if err := c.Control(func(fd uintptr) {
-					// IPV6_FREEBIND = 78 on Linux, allows binding to non-local addresses
-					sErr = syscall.SetsockoptInt(int(fd), syscall.SOL_IPV6, 78, 1)
-				}); err != nil {
-					return err
-				}
-				return sErr
-			},
-		}
-		transport := &http.Transport{
-			DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
-				conn, err := dialer.DialContext(dialCtx, "tcp6", addr)
-				if err != nil {
-					log.Warnf("IPv6 dial failed: src=%s dst=%s err=%v", ipv6Addr, addr, err)
-					return nil, err
-				}
-				log.Debugf("IPv6 dial ok: src=%s dst=%s local=%s", ipv6Addr, addr, conn.LocalAddr())
-				return conn, nil
-			},
-		}
-		client := &http.Client{Transport: transport}
-		if timeout > 0 {
-			client.Timeout = timeout
-		}
-		httpClientCacheMutex.Lock()
-		httpClientCache[cacheKey] = client
-		httpClientCacheMutex.Unlock()
-		return client
 	}
 
 	// Priority 1: Use auth.ProxyURL if configured
@@ -123,12 +61,12 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
-	// Build cache key from proxy URL + auth ID to isolate connection pools per auth
+	// Build cache key from proxy URL + auth ID + IPv6 to isolate connection pools
 	var authID string
 	if auth != nil {
 		authID = auth.ID
 	}
-	cacheKey := proxyURL + "|" + authID
+	cacheKey := proxyURL + "|" + authID + "|" + ipv6Addr
 
 	// Check cache first
 	httpClientCacheMutex.RLock()
@@ -144,6 +82,23 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		return cachedClient
 	}
 	httpClientCacheMutex.RUnlock()
+
+	// If IPv6 source address is configured, create a freebind transport and return early
+	if ipv6Addr != "" {
+		httpClient := &http.Client{}
+		if timeout > 0 {
+			httpClient.Timeout = timeout
+		}
+		transport := buildIPv6FreebindTransport(ipv6Addr)
+		if transport != nil {
+			httpClient.Transport = transport
+			httpClientCacheMutex.Lock()
+			httpClientCache[cacheKey] = httpClient
+			httpClientCacheMutex.Unlock()
+			return httpClient
+		}
+		log.Warnf("failed to create IPv6 freebind transport for %s, falling back", ipv6Addr)
+	}
 
 	// Create new client
 	httpClient := &http.Client{}
@@ -231,4 +186,43 @@ func buildProxyTransport(proxyURL string) *http.Transport {
 	}
 
 	return transport
+}
+
+// buildIPv6FreebindTransport creates an HTTP transport that binds to a specific IPv6 source address
+// using IP_FREEBIND to allow binding to addresses not assigned to a local interface.
+// The eBPF SNAT program on the host will recognize the source IPv6 and perform NAT.
+func buildIPv6FreebindTransport(ipv6Addr string) *http.Transport {
+	srcIP := net.ParseIP(ipv6Addr)
+	if srcIP == nil {
+		log.Warnf("invalid IPv6 address for freebind: %s", ipv6Addr)
+		return nil
+	}
+	localAddr := &net.TCPAddr{IP: srcIP}
+
+	dialer := &net.Dialer{
+		LocalAddr: localAddr,
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		Control: func(network, address string, c syscall.RawConn) error {
+			var sErr error
+			if err := c.Control(func(fd uintptr) {
+				sErr = syscall.SetsockoptInt(int(fd), syscall.SOL_IPV6, IPV6_FREEBIND, 1)
+			}); err != nil {
+				return err
+			}
+			return sErr
+		},
+	}
+
+	return &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			conn, err := dialer.DialContext(ctx, "tcp6", addr)
+			if err != nil {
+				log.Warnf("ipv6 freebind dial failed: src=%s dst=%s err=%v", ipv6Addr, addr, err)
+				return nil, err
+			}
+			log.Debugf("ipv6 freebind connected: src=%s dst=%s local=%s", ipv6Addr, addr, conn.LocalAddr())
+			return conn, nil
+		},
+	}
 }

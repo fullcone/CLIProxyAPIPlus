@@ -123,9 +123,8 @@ type Config struct {
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
 
 	// IPv6Prefix is the IPv6 CIDR prefix used for per-account source address binding.
-	// When set, each Codex OAuth account is assigned a unique IPv6 address from this range.
-	// The eBPF SNAT layer on the host uses the source IPv6 to route traffic.
-	// Example: "2607:8700:5501:979f::2/64"
+	// When set, each Codex account is assigned a unique IPv6 address from this prefix.
+	// Format: "2607:8700:5501:979f::2/64". Only applies to Codex accounts.
 	IPv6Prefix string `yaml:"ipv6-prefix" json:"ipv6-prefix"`
 
 	// IncognitoBrowser enables opening OAuth URLs in incognito/private browsing mode.

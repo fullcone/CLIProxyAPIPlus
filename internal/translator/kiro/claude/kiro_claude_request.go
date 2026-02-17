@@ -681,10 +681,10 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 					h.UserInputMessage.UserInputMessageContext = nil
 				}
 				// Content fallback: if all tool_results were orphaned and removed,
-				// the placeholder content is no longer accurate — revert to generic default.
+				// the content placeholder "Tool results provided." is no longer accurate.
 				if len(ctx.ToolResults) == 0 && strings.TrimSpace(h.UserInputMessage.Content) == kirocommon.DefaultUserContentWithToolResults {
 					h.UserInputMessage.Content = kirocommon.DefaultUserContent
-					log.Debugf("kiro: history[%d] content reverted from DefaultUserContentWithToolResults to DefaultUserContent after orphan removal", i)
+					log.Debugf("kiro: history[%d] content fallback from DefaultUserContentWithToolResults to DefaultUserContent (all tool_results orphaned)", i)
 				}
 			}
 		}
@@ -707,10 +707,10 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 	}
 
 	// Content fallback for currentMessage: if all tool_results were orphaned and removed,
-	// the placeholder content is no longer accurate — revert to generic default.
+	// the content placeholder "Tool results provided." is no longer accurate.
 	if currentUserMsg != nil && len(currentToolResults) == 0 && strings.TrimSpace(currentUserMsg.Content) == kirocommon.DefaultUserContentWithToolResults {
 		currentUserMsg.Content = kirocommon.DefaultUserContent
-		log.Debugf("kiro: currentMessage content reverted from DefaultUserContentWithToolResults to DefaultUserContent after orphan removal")
+		log.Debugf("kiro: currentMessage content fallback from DefaultUserContentWithToolResults to DefaultUserContent (all tool_results orphaned)")
 	}
 
 	return history, currentUserMsg, currentToolResults

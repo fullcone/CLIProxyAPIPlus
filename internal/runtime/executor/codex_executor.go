@@ -578,11 +578,10 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	if cached, ok := e.codexAuthCache.Load(auth.ID); ok {
 		svc = cached.(*codexauth.CodexAuth)
 	} else {
-		// Pass IPv6 address if available so refresh requests use the bound source address
 		var ipv6Addr string
 		if auth.Metadata != nil {
 			if v, ok := auth.Metadata["ipv6"].(string); ok {
-				ipv6Addr = strings.TrimSpace(v)
+				ipv6Addr = v
 			}
 		}
 		if ipv6Addr != "" {

@@ -24,6 +24,7 @@ import (
 
 	"github.com/gin-gonic/gin"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/antigravity"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
@@ -33,7 +34,6 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -293,8 +293,8 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 			}
 		}
 		if filterProvider != "" {
-			prov, _ := entry["provider"].(string)
-			if !strings.EqualFold(prov, filterProvider) {
+			p, _ := entry["provider"].(string)
+			if !strings.EqualFold(p, filterProvider) {
 				continue
 			}
 		}
@@ -1327,7 +1327,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		return
 	}
 
-	// Initialize Codex auth service (IPv6 binding will be set up in the goroutine)
+	// Initialize Codex auth service (may be replaced with IPv6-aware version inside goroutine)
 	openaiAuth := codex.NewCodexAuth(h.cfg)
 
 	// Generate authorization URL
@@ -1398,36 +1398,31 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			time.Sleep(500 * time.Millisecond)
 		}
 
-		log.Debug("Authorization code received, exchanging for tokens...")
-
-		// Pre-allocate IPv6 address for this account (using state as temporary ID)
-		// so that the token exchange request itself goes through the bound IPv6.
-		var allocatedIPv6 string
-		ipv6Pool := config.GetIPv6Pool(h.cfg.IPv6Prefix)
+		// Pre-allocate IPv6 address using temporary ID (state) so that ExchangeCodeForTokens also uses IPv6
+		var assignedIPv6 string
+		ipv6Pool := internalconfig.GetIPv6Pool(h.cfg.IPv6Prefix)
 		if ipv6Pool != nil {
-			if addr, errIPv6 := ipv6Pool.Assign(state); errIPv6 == nil {
-				allocatedIPv6 = addr
-				log.Infof("codex oauth: pre-allocated IPv6 %s for temp ID %s", addr, state)
+			if addr, errIPv6 := ipv6Pool.Assign(state); errIPv6 != nil {
+				log.Warnf("Failed to pre-allocate IPv6 for codex OAuth (state=%s): %v", state, errIPv6)
 			} else {
-				log.Warnf("codex oauth: failed to pre-allocate IPv6 for %s: %v", state, errIPv6)
+				assignedIPv6 = addr
+				log.Infof("Pre-allocated IPv6 %s for codex OAuth (state=%s)", addr, state)
 			}
 		}
 
-		// Re-create CodexAuth with IPv6 binding so exchange goes through the bound address
-		if allocatedIPv6 != "" {
-			openaiAuth = codex.NewCodexAuth(h.cfg, allocatedIPv6)
+		// Re-create CodexAuth with IPv6 if available, so token exchange uses the IPv6 source address
+		exchangeAuth := openaiAuth
+		if assignedIPv6 != "" {
+			exchangeAuth = codex.NewCodexAuth(h.cfg, assignedIPv6)
 		}
 
+		log.Debug("Authorization code received, exchanging for tokens...")
 		// Exchange code for tokens using internal auth service
-		bundle, errExchange := openaiAuth.ExchangeCodeForTokens(ctx, code, pkceCodes)
+		bundle, errExchange := exchangeAuth.ExchangeCodeForTokens(ctx, code, pkceCodes)
 		if errExchange != nil {
 			authErr := codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, errExchange)
 			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
-			// Clean up temporary IPv6 allocation on failure
-			if ipv6Pool != nil && allocatedIPv6 != "" {
-				ipv6Pool.Unregister(state)
-			}
 			return
 		}
 
@@ -1444,28 +1439,14 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		}
 
 		// Create token storage and persist
-		tokenStorage := openaiAuth.CreateTokenStorage(bundle)
-
-		// Write IPv6 into token storage
-		if allocatedIPv6 != "" {
-			tokenStorage.IPv6 = allocatedIPv6
-		}
-
+		tokenStorage := exchangeAuth.CreateTokenStorage(bundle)
+		tokenStorage.IPv6 = assignedIPv6
 		fileName := codex.CredentialFileName(tokenStorage.Email, planType, hashAccountID, true)
 
-		// If the permanent fileName differs from the temporary state ID,
-		// re-register the IPv6 under the permanent ID.
-		if ipv6Pool != nil && allocatedIPv6 != "" && fileName != state {
+		// If the final fileName differs from the temporary state ID, re-register the IPv6 under the real ID
+		if ipv6Pool != nil && assignedIPv6 != "" && fileName != state {
 			ipv6Pool.Unregister(state)
-			ipv6Pool.Register(fileName, allocatedIPv6)
-		}
-
-		metadata := map[string]any{
-			"email":      tokenStorage.Email,
-			"account_id": tokenStorage.AccountID,
-		}
-		if allocatedIPv6 != "" {
-			metadata["ipv6"] = allocatedIPv6
+			ipv6Pool.Register(fileName, assignedIPv6)
 		}
 
 		record := &coreauth.Auth{
@@ -1473,7 +1454,11 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			Provider: "codex",
 			FileName: fileName,
 			Storage:  tokenStorage,
-			Metadata: metadata,
+			Metadata: map[string]any{
+				"email":      tokenStorage.Email,
+				"account_id": tokenStorage.AccountID,
+				"ipv6":       assignedIPv6,
+			},
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {

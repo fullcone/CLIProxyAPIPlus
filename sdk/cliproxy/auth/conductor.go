@@ -1510,9 +1510,9 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 
 // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
 // The provider parameter controls which backoff strategy is used:
-//   - "kiro": exponential backoff capped at kiroQuotaBackoffMax (1 min); level always increments.
+//   - "kiro": exponential backoff capped at kiroQuotaBackoffMax (1m); level keeps incrementing past cap.
 //   - "codex": fixed 24-hour cooldown; level unchanged.
-//   - others: original exponential backoff capped at quotaBackoffMax (30 min).
+//   - others: original exponential backoff capped at quotaBackoffMax (30m); level freezes at cap.
 func nextQuotaCooldown(prevLevel int, disableCooling bool, provider string) (time.Duration, int) {
 	if prevLevel < 0 {
 		prevLevel = 0

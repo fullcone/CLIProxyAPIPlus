@@ -124,7 +124,7 @@ type Config struct {
 
 	// IPv6Prefix is the IPv6 CIDR prefix used for per-account source address binding.
 	// When set, each Codex OAuth account is assigned a unique IPv6 address from this prefix.
-	// Format: "2607:8700:5501:979f::2/64". Only used for Codex; Kiro does not support IPv6.
+	// Format example: "2607:8700:5501:979f::2/64"
 	IPv6Prefix string `yaml:"ipv6-prefix" json:"ipv6-prefix"`
 
 	// IncognitoBrowser enables opening OAuth URLs in incognito/private browsing mode.

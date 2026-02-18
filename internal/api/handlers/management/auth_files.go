@@ -27,13 +27,13 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
+	cfgpkg "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/gemini"
 	iflowauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/iflow"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kilo"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -1398,9 +1398,9 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			time.Sleep(500 * time.Millisecond)
 		}
 
-		// Pre-allocate IPv6 address using temporary ID (state) so that token exchange also uses IPv6
+		// Pre-allocate IPv6 address using temporary ID (state) so that ExchangeCodeForTokens uses it
 		var ipv6Addr string
-		pool := config.GetIPv6Pool(h.cfg.IPv6Prefix)
+		pool := cfgpkg.GetIPv6Pool(h.cfg.IPv6Prefix)
 		if pool != nil {
 			var errIPv6 error
 			ipv6Addr, errIPv6 = pool.Assign(state)
@@ -1411,7 +1411,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			}
 		}
 
-		// Create CodexAuth with IPv6 so that ExchangeCodeForTokens uses the bound address
+		// Create CodexAuth with IPv6 so exchange request uses the bound address
 		var exchangeAuth *codex.CodexAuth
 		if ipv6Addr != "" {
 			exchangeAuth = codex.NewCodexAuth(h.cfg, ipv6Addr)
@@ -1443,15 +1443,15 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 
 		// Create token storage and persist
 		tokenStorage := exchangeAuth.CreateTokenStorage(bundle)
+		if ipv6Addr != "" {
+			tokenStorage.IPv6 = ipv6Addr
+		}
 		fileName := codex.CredentialFileName(tokenStorage.Email, planType, hashAccountID, true)
 
 		// Re-register IPv6 under the permanent fileName if it differs from the temporary state ID
-		if pool != nil && ipv6Addr != "" {
-			if fileName != state {
-				pool.Unregister(state)
-				pool.Register(fileName, ipv6Addr)
-			}
-			tokenStorage.IPv6 = ipv6Addr
+		if pool != nil && ipv6Addr != "" && fileName != state {
+			pool.Unregister(state)
+			pool.Register(fileName, ipv6Addr)
 		}
 
 		record := &coreauth.Auth{

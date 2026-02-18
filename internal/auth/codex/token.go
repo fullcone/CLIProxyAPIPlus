@@ -32,7 +32,7 @@ type CodexTokenStorage struct {
 	Type string `json:"type"`
 	// Expire is the timestamp when the current access token expires.
 	Expire string `json:"expired"`
-	// IPv6 is the bound IPv6 source address for this account (persisted across restarts).
+	// IPv6 is the assigned IPv6 source address for this account (used for eBPF SNAT binding).
 	IPv6 string `json:"ipv6,omitempty"`
 }
 

@@ -38,23 +38,21 @@ type CodexAuth struct {
 
 // NewCodexAuth creates a new CodexAuth service instance.
 // It initializes an HTTP client with proxy settings from the provided configuration.
-// An optional IPv6 source address can be provided to bind outgoing connections.
+// An optional IPv6 address can be provided to bind the HTTP client to a specific source address
+// for eBPF SNAT scenarios.
 func NewCodexAuth(cfg *config.Config, ipv6Addr ...string) *CodexAuth {
 	httpClient := &http.Client{}
 
-	// If an IPv6 source address is provided, create a transport with IP_FREEBIND + LocalAddr
-	addr := ""
+	// If an IPv6 address is provided, create a transport with IP_FREEBIND + LocalAddr
+	var boundIPv6 string
 	if len(ipv6Addr) > 0 {
-		addr = strings.TrimSpace(ipv6Addr[0])
+		boundIPv6 = strings.TrimSpace(ipv6Addr[0])
 	}
-	if addr != "" {
-		srcIP := net.ParseIP(addr)
+	if boundIPv6 != "" {
+		srcIP := net.ParseIP(boundIPv6)
 		if srcIP != nil {
-			localAddr := &net.TCPAddr{IP: srcIP}
 			dialer := &net.Dialer{
-				LocalAddr: localAddr,
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
+				LocalAddr: &net.TCPAddr{IP: srcIP},
 				Control: func(network, address string, c syscall.RawConn) error {
 					var opErr error
 					if err := c.Control(func(fd uintptr) {
@@ -66,17 +64,12 @@ func NewCodexAuth(cfg *config.Config, ipv6Addr ...string) *CodexAuth {
 					return opErr
 				},
 			}
-			httpClient.Transport = &http.Transport{
-				DialContext: func(dialCtx context.Context, network, dialAddr string) (net.Conn, error) {
-					conn, err := dialer.DialContext(dialCtx, "tcp6", dialAddr)
-					if err != nil {
-						log.Warnf("CodexAuth IPv6 dial failed: src=%s dst=%s err=%v", addr, dialAddr, err)
-						return nil, err
-					}
-					log.Debugf("CodexAuth IPv6 dial ok: src=%s dst=%s local=%s", addr, dialAddr, conn.LocalAddr())
-					return conn, nil
+			transport := &http.Transport{
+				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+					return dialer.DialContext(ctx, "tcp6", addr)
 				},
 			}
+			httpClient.Transport = transport
 		}
 	}
 

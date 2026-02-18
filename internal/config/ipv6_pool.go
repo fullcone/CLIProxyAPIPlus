@@ -12,47 +12,47 @@ import (
 type IPv6Pool struct {
 	mu      sync.Mutex
 	network *net.IPNet
-	prefix  net.IP
-	ones    int // prefix length in bits
+	prefix  net.IP // 16-byte network address
+	ones    int    // prefix length
 
 	forward map[string]string // authID -> IPv6 string
 	reverse map[string]string // IPv6 string -> authID
 }
 
 var (
-	ipv6PoolOnce     sync.Once
-	ipv6PoolInstance *IPv6Pool
+	globalIPv6Pool     *IPv6Pool
+	globalIPv6PoolOnce sync.Once
 )
 
-// GetIPv6Pool returns the global IPv6Pool singleton.
-// If cidr is empty, returns nil. Initialised once; subsequent calls ignore cidr.
+// GetIPv6Pool returns the global IPv6Pool singleton. If cidr is empty, returns nil.
+// The pool is initialized once; subsequent calls ignore the cidr parameter.
 func GetIPv6Pool(cidr string) *IPv6Pool {
 	if cidr == "" {
-		return ipv6PoolInstance // may be nil
+		return nil
 	}
-	ipv6PoolOnce.Do(func() {
+	globalIPv6PoolOnce.Do(func() {
 		pool, err := newIPv6Pool(cidr)
 		if err != nil {
-			fmt.Printf("ipv6 pool init error: %v\n", err)
+			fmt.Printf("WARNING: failed to initialize IPv6 pool from %q: %v\n", cidr, err)
 			return
 		}
-		ipv6PoolInstance = pool
+		globalIPv6Pool = pool
 	})
-	return ipv6PoolInstance
+	return globalIPv6Pool
 }
 
 func newIPv6Pool(cidr string) (*IPv6Pool, error) {
 	ip, ipNet, err := net.ParseCIDR(cidr)
 	if err != nil {
-		return nil, fmt.Errorf("invalid IPv6 CIDR %q: %w", cidr, err)
-	}
-	ones, bits := ipNet.Mask.Size()
-	if bits != 128 {
-		return nil, fmt.Errorf("expected IPv6 CIDR, got %d-bit network", bits)
+		return nil, fmt.Errorf("parse CIDR %q: %w", cidr, err)
 	}
 	prefix := ip.To16()
 	if prefix == nil {
-		prefix = ipNet.IP.To16()
+		return nil, fmt.Errorf("not a valid IPv6 address: %s", cidr)
+	}
+	ones, bits := ipNet.Mask.Size()
+	if bits != 128 {
+		return nil, fmt.Errorf("not an IPv6 CIDR: %s", cidr)
 	}
 	return &IPv6Pool{
 		network: ipNet,
@@ -63,11 +63,8 @@ func newIPv6Pool(cidr string) (*IPv6Pool, error) {
 	}, nil
 }
 
-// Assign returns the IPv6 address for authID, allocating a new one if needed.
+// Assign returns the IPv6 address for authID. If not yet assigned, generates a new unique one.
 func (p *IPv6Pool) Assign(authID string) (string, error) {
-	if p == nil {
-		return "", fmt.Errorf("ipv6 pool is nil")
-	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 
@@ -77,24 +74,20 @@ func (p *IPv6Pool) Assign(authID string) (string, error) {
 	return p.generateUnique(authID)
 }
 
-// Register records an existing authID -> IPv6 mapping (used at startup for persisted accounts).
+// Register records an existing authID -> IPv6 mapping (used at startup to load persisted addresses).
 func (p *IPv6Pool) Register(authID, ipv6 string) {
-	if p == nil || authID == "" || ipv6 == "" {
-		return
-	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	p.forward[authID] = ipv6
 	p.reverse[ipv6] = authID
 }
 
-// Unregister removes the mapping for authID (used when swapping temp ID for permanent ID).
+// Unregister removes the mapping for authID (used when replacing a temporary ID with a permanent one).
 func (p *IPv6Pool) Unregister(authID string) {
-	if p == nil || authID == "" {
-		return
-	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	if addr, ok := p.forward[authID]; ok {
 		delete(p.reverse, addr)
 		delete(p.forward, authID)
@@ -103,62 +96,62 @@ func (p *IPv6Pool) Unregister(authID string) {
 
 // Get returns the IPv6 address for authID, or empty string if not assigned.
 func (p *IPv6Pool) Get(authID string) string {
-	if p == nil {
-		return ""
-	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
+
 	return p.forward[authID]
 }
 
-// generateUnique creates a random IPv6 within the prefix that is not yet allocated.
+// generateUnique creates a random IPv6 within the prefix that doesn't collide with existing assignments.
 // Must be called with p.mu held.
 func (p *IPv6Pool) generateUnique(authID string) (string, error) {
-	prefixBytes := len(p.network.Mask) // 16
 	for attempts := 0; attempts < 1000; attempts++ {
-		addr := make(net.IP, prefixBytes)
-		copy(addr, p.prefix)
+		ip := make(net.IP, 16)
+		copy(ip, p.prefix)
 
-		// Fill random bytes for the host portion
-		randomBytes := make([]byte, prefixBytes)
+		// Fill random bytes into the host portion
+		randomBytes := make([]byte, 16)
 		if _, err := rand.Read(randomBytes); err != nil {
 			return "", fmt.Errorf("crypto/rand failed: %w", err)
 		}
 
-		// Apply: keep prefix bits from p.prefix, fill suffix bits from random
-		for i := 0; i < prefixBytes; i++ {
-			maskByte := p.network.Mask[i]
-			addr[i] = (p.prefix[i] & maskByte) | (randomBytes[i] & ^maskByte)
+		// Preserve prefix bits, randomize host bits
+		for i := 0; i < 16; i++ {
+			bitsInByte := p.ones - i*8
+			if bitsInByte >= 8 {
+				// Entire byte is prefix — keep it
+				continue
+			} else if bitsInByte <= 0 {
+				// Entire byte is host — use random
+				ip[i] = randomBytes[i]
+			} else {
+				// Partial: keep top bitsInByte bits from prefix, rest from random
+				mask := byte(0xFF << (8 - bitsInByte))
+				ip[i] = (ip[i] & mask) | (randomBytes[i] & ^mask)
+			}
 		}
 
-		// Exclude low-value addresses that may conflict with gateway/primary
-		if isLowAddress(addr) {
+		// Exclude low addresses that may conflict with gateway/primary:
+		// If bytes [8..14] are all zero and byte[15] <= 200, skip.
+		isLow := true
+		for b := 8; b <= 14; b++ {
+			if ip[b] != 0 {
+				isLow = false
+				break
+			}
+		}
+		if isLow && ip[15] <= 200 {
 			continue
 		}
 
-		addrStr := addr.String()
-		if _, taken := p.reverse[addrStr]; taken {
+		addr := ip.String()
+		if _, taken := p.reverse[addr]; taken {
 			continue
 		}
 
-		p.forward[authID] = addrStr
-		p.reverse[addrStr] = authID
-		return addrStr, nil
+		p.forward[authID] = addr
+		p.reverse[addr] = authID
+		return addr, nil
 	}
 	return "", fmt.Errorf("failed to generate unique IPv6 after 1000 attempts")
-}
-
-// isLowAddress returns true if bytes [8..14] are all zero and byte[15] <= 200.
-// These addresses (like ::1, ::2, ::c8) may conflict with gateway/primary addresses.
-func isLowAddress(ip net.IP) bool {
-	ip = ip.To16()
-	if ip == nil {
-		return false
-	}
-	for i := 8; i <= 14; i++ {
-		if ip[i] != 0 {
-			return false
-		}
-	}
-	return ip[15] <= 200
 }

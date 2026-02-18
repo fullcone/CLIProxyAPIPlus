@@ -21,9 +21,6 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
-// ipv6FreebindConst is the Linux IPV6_FREEBIND socket option value (not exported by syscall).
-const ipv6FreebindConst = 78
-
 // OAuth configuration constants for OpenAI Codex
 const (
 	AuthURL     = "https://auth.openai.com/oauth/authorize"
@@ -41,14 +38,17 @@ type CodexAuth struct {
 
 // NewCodexAuth creates a new CodexAuth service instance.
 // It initializes an HTTP client with proxy settings from the provided configuration.
-// If an optional IPv6 address is provided, the client binds to that source address
-// using IP_FREEBIND for eBPF SNAT integration.
+// An optional IPv6 source address can be provided to bind outgoing connections.
 func NewCodexAuth(cfg *config.Config, ipv6Addr ...string) *CodexAuth {
-	client := &http.Client{}
+	httpClient := &http.Client{}
 
-	// If IPv6 address provided, create a freebind transport
-	if len(ipv6Addr) > 0 && ipv6Addr[0] != "" {
-		srcIP := net.ParseIP(ipv6Addr[0])
+	// If an IPv6 source address is provided, create a transport with IP_FREEBIND + LocalAddr
+	addr := ""
+	if len(ipv6Addr) > 0 {
+		addr = strings.TrimSpace(ipv6Addr[0])
+	}
+	if addr != "" {
+		srcIP := net.ParseIP(addr)
 		if srcIP != nil {
 			localAddr := &net.TCPAddr{IP: srcIP}
 			dialer := &net.Dialer{
@@ -56,30 +56,32 @@ func NewCodexAuth(cfg *config.Config, ipv6Addr ...string) *CodexAuth {
 				Timeout:   30 * time.Second,
 				KeepAlive: 30 * time.Second,
 				Control: func(network, address string, c syscall.RawConn) error {
-					var sErr error
+					var opErr error
 					if err := c.Control(func(fd uintptr) {
-						sErr = syscall.SetsockoptInt(int(fd), syscall.SOL_IPV6, ipv6FreebindConst, 1)
+						// IPV6_FREEBIND = 78 on Linux (not exported by syscall package)
+						opErr = syscall.SetsockoptInt(int(fd), syscall.SOL_IPV6, 78, 1)
 					}); err != nil {
 						return err
 					}
-					return sErr
+					return opErr
 				},
 			}
-			transport := &http.Transport{
-				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					return dialer.DialContext(ctx, "tcp6", addr)
+			httpClient.Transport = &http.Transport{
+				DialContext: func(dialCtx context.Context, network, dialAddr string) (net.Conn, error) {
+					conn, err := dialer.DialContext(dialCtx, "tcp6", dialAddr)
+					if err != nil {
+						log.Warnf("CodexAuth IPv6 dial failed: src=%s dst=%s err=%v", addr, dialAddr, err)
+						return nil, err
+					}
+					log.Debugf("CodexAuth IPv6 dial ok: src=%s dst=%s local=%s", addr, dialAddr, conn.LocalAddr())
+					return conn, nil
 				},
 			}
-			client.Transport = transport
-			log.Debugf("codex auth: using IPv6 freebind source %s", ipv6Addr[0])
 		}
 	}
 
-	// Apply proxy settings (will set transport if no IPv6 transport was set)
-	client = util.SetProxy(&cfg.SDKConfig, client)
-
 	return &CodexAuth{
-		httpClient: client,
+		httpClient: util.SetProxy(&cfg.SDKConfig, httpClient),
 	}
 }
 

@@ -16,10 +16,6 @@ import (
 	"golang.org/x/net/proxy"
 )
 
-// IPV6_FREEBIND allows binding to an IPv6 address not assigned to a local interface.
-// Linux kernel constant, not exported by syscall package.
-const IPV6_FREEBIND = 78
-
 // httpClientCache caches HTTP clients by proxy URL to enable connection reuse
 var (
 	httpClientCache      = make(map[string]*http.Client)
@@ -42,11 +38,11 @@ var (
 // Returns:
 //   - *http.Client: An HTTP client with configured proxy or transport
 func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	// Check for IPv6 source address binding (Codex accounts only)
+	// Check for IPv6 source address binding (Codex only)
 	var ipv6Addr string
 	if auth != nil && auth.Metadata != nil {
-		if v, ok := auth.Metadata["ipv6"].(string); ok && v != "" {
-			ipv6Addr = v
+		if v, ok := auth.Metadata["ipv6"].(string); ok {
+			ipv6Addr = strings.TrimSpace(v)
 		}
 	}
 
@@ -83,21 +79,49 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	}
 	httpClientCacheMutex.RUnlock()
 
-	// If IPv6 source address is configured, create a freebind transport and return early
+	// If IPv6 source address is configured, create a client with IP_FREEBIND + LocalAddr
 	if ipv6Addr != "" {
 		httpClient := &http.Client{}
 		if timeout > 0 {
 			httpClient.Timeout = timeout
 		}
-		transport := buildIPv6FreebindTransport(ipv6Addr)
-		if transport != nil {
+		srcIP := net.ParseIP(ipv6Addr)
+		if srcIP == nil {
+			log.Warnf("invalid IPv6 address %q for auth %s, falling back to default", ipv6Addr, authID)
+		} else {
+			localAddr := &net.TCPAddr{IP: srcIP}
+			dialer := &net.Dialer{
+				LocalAddr: localAddr,
+				Timeout:   30 * time.Second,
+				KeepAlive: 30 * time.Second,
+				Control: func(network, address string, c syscall.RawConn) error {
+					var opErr error
+					if err := c.Control(func(fd uintptr) {
+						// IPV6_FREEBIND = 78 on Linux (not exported by syscall package)
+						opErr = syscall.SetsockoptInt(int(fd), syscall.SOL_IPV6, 78, 1)
+					}); err != nil {
+						return err
+					}
+					return opErr
+				},
+			}
+			transport := &http.Transport{
+				DialContext: func(dialCtx context.Context, network, addr string) (net.Conn, error) {
+					conn, err := dialer.DialContext(dialCtx, "tcp6", addr)
+					if err != nil {
+						log.Warnf("IPv6 dial failed: src=%s dst=%s err=%v", ipv6Addr, addr, err)
+						return nil, err
+					}
+					log.Debugf("IPv6 dial ok: src=%s dst=%s local=%s", ipv6Addr, addr, conn.LocalAddr())
+					return conn, nil
+				},
+			}
 			httpClient.Transport = transport
 			httpClientCacheMutex.Lock()
 			httpClientCache[cacheKey] = httpClient
 			httpClientCacheMutex.Unlock()
 			return httpClient
 		}
-		log.Warnf("failed to create IPv6 freebind transport for %s, falling back", ipv6Addr)
 	}
 
 	// Create new client
@@ -186,43 +210,4 @@ func buildProxyTransport(proxyURL string) *http.Transport {
 	}
 
 	return transport
-}
-
-// buildIPv6FreebindTransport creates an HTTP transport that binds to a specific IPv6 source address
-// using IP_FREEBIND to allow binding to addresses not assigned to a local interface.
-// The eBPF SNAT program on the host will recognize the source IPv6 and perform NAT.
-func buildIPv6FreebindTransport(ipv6Addr string) *http.Transport {
-	srcIP := net.ParseIP(ipv6Addr)
-	if srcIP == nil {
-		log.Warnf("invalid IPv6 address for freebind: %s", ipv6Addr)
-		return nil
-	}
-	localAddr := &net.TCPAddr{IP: srcIP}
-
-	dialer := &net.Dialer{
-		LocalAddr: localAddr,
-		Timeout:   30 * time.Second,
-		KeepAlive: 30 * time.Second,
-		Control: func(network, address string, c syscall.RawConn) error {
-			var sErr error
-			if err := c.Control(func(fd uintptr) {
-				sErr = syscall.SetsockoptInt(int(fd), syscall.SOL_IPV6, IPV6_FREEBIND, 1)
-			}); err != nil {
-				return err
-			}
-			return sErr
-		},
-	}
-
-	return &http.Transport{
-		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-			conn, err := dialer.DialContext(ctx, "tcp6", addr)
-			if err != nil {
-				log.Warnf("ipv6 freebind dial failed: src=%s dst=%s err=%v", ipv6Addr, addr, err)
-				return nil, err
-			}
-			log.Debugf("ipv6 freebind connected: src=%s dst=%s local=%s", ipv6Addr, addr, conn.LocalAddr())
-			return conn, nil
-		},
-	}
 }

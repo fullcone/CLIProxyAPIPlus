@@ -109,6 +109,9 @@ func (h *Handler) SetConfig(cfg *config.Config) { h.cfg = cfg }
 // SetAuthManager updates the auth manager reference used by management endpoints.
 func (h *Handler) SetAuthManager(manager *coreauth.Manager) { h.authManager = manager }
 
+// AuthManagerRef returns the underlying auth manager reference (used for startup backfill).
+func (h *Handler) AuthManagerRef() *coreauth.Manager { return h.authManager }
+
 // SetUsageStatistics allows replacing the usage statistics reference.
 func (h *Handler) SetUsageStatistics(stats *usage.RequestStatistics) { h.usageStats = stats }
 

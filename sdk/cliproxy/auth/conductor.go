@@ -50,9 +50,10 @@ const (
 	refreshCheckInterval  = 30 * time.Second
 	refreshPendingBackoff = time.Minute
 	refreshFailureBackoff = 1 * time.Minute
-	quotaBackoffBase       = time.Second
-	quotaBackoffMax        = 30 * time.Minute
-	kiroQuotaBackoffMax    = 1 * time.Minute
+	quotaBackoffBase      = time.Second
+	quotaBackoffMax       = 30 * time.Minute
+	kiroQuotaBackoffMax   = 1 * time.Minute
+	codexQuotaCooldown    = 24 * time.Hour
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -1508,6 +1509,10 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 }
 
 // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
+// The provider parameter controls which backoff strategy is used:
+//   - "kiro": exponential backoff capped at kiroQuotaBackoffMax (1 min); level always increments.
+//   - "codex": fixed 24-hour cooldown; level unchanged.
+//   - others: original exponential backoff capped at quotaBackoffMax (30 min).
 func nextQuotaCooldown(prevLevel int, disableCooling bool, provider string) (time.Duration, int) {
 	if prevLevel < 0 {
 		prevLevel = 0
@@ -1515,13 +1520,23 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool, provider string) (tim
 	if disableCooling {
 		return 0, prevLevel
 	}
+
 	if strings.EqualFold(provider, "kiro") {
 		cooldown := quotaBackoffBase << uint(prevLevel)
+		if cooldown < quotaBackoffBase {
+			cooldown = quotaBackoffBase
+		}
 		if cooldown > kiroQuotaBackoffMax {
 			cooldown = kiroQuotaBackoffMax
 		}
 		return cooldown, prevLevel + 1
 	}
+
+	if strings.EqualFold(provider, "codex") {
+		return codexQuotaCooldown, prevLevel
+	}
+
+	// Default: original logic for all other providers.
 	cooldown := quotaBackoffBase * time.Duration(1<<prevLevel)
 	if cooldown < quotaBackoffBase {
 		cooldown = quotaBackoffBase

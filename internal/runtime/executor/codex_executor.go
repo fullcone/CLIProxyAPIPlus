@@ -39,7 +39,7 @@ var dataTag = []byte("data:")
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type CodexExecutor struct {
 	cfg            *config.Config
-	codexAuthCache sync.Map // key: auth.ID (string), value: *codexauth.CodexAuth
+	codexAuthCache sync.Map // key: auth.ID (string) → value: *codexauth.CodexAuth
 }
 
 func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor{cfg: cfg} }
@@ -578,10 +578,9 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	if cached, ok := e.codexAuthCache.Load(auth.ID); ok {
 		svc = cached.(*codexauth.CodexAuth)
 	} else {
-		// Pass IPv6 address if available so refresh requests use the bound source address
 		var ipv6Addr string
 		if auth.Metadata != nil {
-			if v, ok := auth.Metadata["ipv6"].(string); ok && v != "" {
+			if v, ok := auth.Metadata["ipv6"].(string); ok {
 				ipv6Addr = v
 			}
 		}

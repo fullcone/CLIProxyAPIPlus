@@ -680,11 +680,11 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 				if len(ctx.ToolResults) == 0 && len(ctx.Tools) == 0 {
 					h.UserInputMessage.UserInputMessageContext = nil
 				}
-				// Content fallback: if all tool_results were orphan-dropped but content
-				// was set to DefaultUserContentWithToolResults, revert to DefaultUserContent.
+				// Content fallback: if all tool_results were removed by orphan filtering
+				// but content still says "Tool results provided.", revert to generic default.
 				if len(ctx.ToolResults) == 0 && strings.TrimSpace(h.UserInputMessage.Content) == kirocommon.DefaultUserContentWithToolResults {
 					h.UserInputMessage.Content = kirocommon.DefaultUserContent
-					log.Debugf("kiro: history[%d] content reverted from '%s' to '%s' after orphan cleanup", i, kirocommon.DefaultUserContentWithToolResults, kirocommon.DefaultUserContent)
+					log.Debugf("kiro: history[%d] content reverted from DefaultUserContentWithToolResults to DefaultUserContent after orphan filtering", i)
 				}
 			}
 		}
@@ -706,11 +706,11 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 		currentToolResults = filtered
 	}
 
-	// Content fallback for currentMessage: if all tool_results were orphan-dropped
-	// but content was set to DefaultUserContentWithToolResults, revert to DefaultUserContent.
+	// Content fallback for currentMessage: if all tool_results were removed by orphan filtering
+	// but content still says "Tool results provided.", revert to generic default.
 	if currentUserMsg != nil && len(currentToolResults) == 0 && strings.TrimSpace(currentUserMsg.Content) == kirocommon.DefaultUserContentWithToolResults {
 		currentUserMsg.Content = kirocommon.DefaultUserContent
-		log.Debugf("kiro: currentMessage content reverted from '%s' to '%s' after orphan cleanup", kirocommon.DefaultUserContentWithToolResults, kirocommon.DefaultUserContent)
+		log.Debugf("kiro: currentMessage content reverted from DefaultUserContentWithToolResults to DefaultUserContent after orphan filtering")
 	}
 
 	return history, currentUserMsg, currentToolResults

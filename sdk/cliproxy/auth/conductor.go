@@ -1580,19 +1580,23 @@ func nextQuotaCooldown(prevLevel int, disableCooling bool, provider string) (tim
 	if disableCooling {
 		return 0, prevLevel
 	}
+
 	if strings.EqualFold(provider, "kiro") {
 		cooldown := quotaBackoffBase << uint(prevLevel)
 		if cooldown < quotaBackoffBase {
 			cooldown = quotaBackoffBase
 		}
-		if cooldown >= kiroQuotaBackoffMax {
-			return kiroQuotaBackoffMax, prevLevel + 1
+		if cooldown > kiroQuotaBackoffMax {
+			cooldown = kiroQuotaBackoffMax
 		}
 		return cooldown, prevLevel + 1
 	}
+
 	if strings.EqualFold(provider, "codex") {
 		return codexQuotaCooldown, prevLevel
 	}
+
+	// Default: original logic for all other providers.
 	cooldown := quotaBackoffBase * time.Duration(1<<prevLevel)
 	if cooldown < quotaBackoffBase {
 		cooldown = quotaBackoffBase

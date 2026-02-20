@@ -33,7 +33,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -1479,29 +1479,33 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			time.Sleep(500 * time.Millisecond)
 		}
 
-		// Pre-allocate IPv6 address using state as temporary ID so that token exchange also uses IPv6
-		var ipv6Addr string
-		ipv6Pool := config.GetIPv6Pool(h.cfg.IPv6Prefix)
+		// Pre-allocate IPv6 address before token exchange so the exchange request also uses IPv6.
+		var ipv6Str string
+		ipv6Pool := internalconfig.GetIPv6Pool(h.cfg.IPv6Prefix)
 		if ipv6Pool != nil {
-			allocated, errIPv6 := ipv6Pool.Assign(state)
+			ipv6IP, errIPv6 := ipv6Pool.Assign(state)
 			if errIPv6 != nil {
 				log.Warnf("codex oauth: failed to pre-allocate IPv6 for state %s: %v", state, errIPv6)
 			} else {
-				ipv6Addr = allocated
-				log.Infof("codex oauth: pre-allocated IPv6 %s for state %s", ipv6Addr, state)
+				ipv6Str = ipv6IP.String()
+				log.Infof("codex oauth: pre-allocated IPv6 %s for state %s", ipv6Str, state)
 			}
 		}
 
-		// Create CodexAuth with IPv6 so that ExchangeCodeForTokens uses the bound address
-		codexAuthSvc := codex.NewCodexAuth(h.cfg, ipv6Addr)
-
 		log.Debug("Authorization code received, exchanging for tokens...")
 		// Exchange code for tokens using internal auth service (with retry for transient errors)
+		// If IPv6 is available, create a new CodexAuth bound to that address.
+		var exchangeAuth *codex.CodexAuth
+		if ipv6Str != "" {
+			exchangeAuth = codex.NewCodexAuth(h.cfg, ipv6Str)
+		} else {
+			exchangeAuth = openaiAuth
+		}
 		const maxExchangeAttempts = 4
 		var bundle *codex.CodexAuthBundle
 		var errExchange error
 		for attempt := 1; attempt <= maxExchangeAttempts; attempt++ {
-			bundle, errExchange = codexAuthSvc.ExchangeCodeForTokens(ctx, code, pkceCodes)
+			bundle, errExchange = exchangeAuth.ExchangeCodeForTokens(ctx, code, pkceCodes)
 			if errExchange == nil {
 				break
 			}
@@ -1519,10 +1523,6 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			time.Sleep(backoff)
 		}
 		if errExchange != nil {
-			// Clean up temporary IPv6 allocation on failure
-			if ipv6Pool != nil && ipv6Addr != "" {
-				ipv6Pool.Unregister(state)
-			}
 			authErr := codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, errExchange)
 			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
@@ -1542,16 +1542,17 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		}
 
 		// Create token storage and persist
-		tokenStorage := codexAuthSvc.CreateTokenStorage(bundle)
-		fileName := codex.CredentialFileName(tokenStorage.Email, planType, hashAccountID, true)
+		tokenStorage := exchangeAuth.CreateTokenStorage(bundle)
 
-		// Re-register IPv6 under the permanent fileName if it differs from the temp state ID
-		if ipv6Pool != nil && ipv6Addr != "" {
+		// Assign IPv6 to the permanent fileName and update token storage.
+		fileName := codex.CredentialFileName(tokenStorage.Email, planType, hashAccountID, true)
+		if ipv6Pool != nil && ipv6Str != "" {
+			// Re-register the IPv6 under the permanent fileName if it differs from the temp state ID.
 			if fileName != state {
 				ipv6Pool.Unregister(state)
-				ipv6Pool.Register(fileName, ipv6Addr)
+				ipv6Pool.Register(fileName, net.ParseIP(ipv6Str))
 			}
-			tokenStorage.IPv6 = ipv6Addr
+			tokenStorage.IPv6 = ipv6Str
 		}
 
 		record := &coreauth.Auth{
@@ -1564,8 +1565,8 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				"account_id": tokenStorage.AccountID,
 			},
 		}
-		if ipv6Addr != "" {
-			record.Metadata["ipv6"] = ipv6Addr
+		if ipv6Str != "" {
+			record.Metadata["ipv6"] = ipv6Str
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {

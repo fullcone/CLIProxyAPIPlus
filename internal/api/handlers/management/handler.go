@@ -128,22 +128,6 @@ func (h *Handler) SetLogDirectory(dir string) {
 	h.logDir = dir
 }
 
-// AuthManagerRef returns the underlying auth manager for read-only access (e.g. IPv6 backfill).
-func (h *Handler) AuthManagerRef() *coreauth.Manager {
-	if h == nil {
-		return nil
-	}
-	return h.authManager
-}
-
-// TokenStoreRef returns the token store with the configured base directory.
-func (h *Handler) TokenStoreRef() coreauth.Store {
-	if h == nil {
-		return nil
-	}
-	return h.tokenStoreWithBaseDir()
-}
-
 // Middleware enforces access control for management endpoints.
 // All requests (local and remote) require a valid management key.
 // Additionally, remote access requires allow-remote-management=true.

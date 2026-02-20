@@ -39,20 +39,20 @@ type CodexAuth struct {
 // NewCodexAuth creates a new CodexAuth service instance.
 // It initializes an HTTP client with proxy settings from the provided configuration.
 // An optional IPv6 address can be passed to bind the HTTP client to a specific source address
-// using IP_FREEBIND for eBPF SNAT.
+// using IP_FREEBIND (for eBPF SNAT scenarios).
 func NewCodexAuth(cfg *config.Config, ipv6Addr ...string) *CodexAuth {
 	httpClient := &http.Client{}
 
-	// If an IPv6 address is provided, create a transport with IP_FREEBIND + LocalAddr
-	var ipv6Str string
+	// If a non-empty IPv6 address is provided, create a transport with IP_FREEBIND + LocalAddr.
+	var boundIPv6 string
 	if len(ipv6Addr) > 0 {
-		ipv6Str = strings.TrimSpace(ipv6Addr[0])
+		boundIPv6 = strings.TrimSpace(ipv6Addr[0])
 	}
-	if ipv6Str != "" {
-		ip := net.ParseIP(ipv6Str)
-		if ip != nil {
+	if boundIPv6 != "" {
+		ipv6IP := net.ParseIP(boundIPv6)
+		if ipv6IP != nil {
 			dialer := &net.Dialer{
-				LocalAddr: &net.TCPAddr{IP: ip},
+				LocalAddr: &net.TCPAddr{IP: ipv6IP},
 				Control: func(network, address string, c syscall.RawConn) error {
 					var opErr error
 					if err := c.Control(func(fd uintptr) {
@@ -65,24 +65,15 @@ func NewCodexAuth(cfg *config.Config, ipv6Addr ...string) *CodexAuth {
 				},
 			}
 			transport := &http.Transport{
-				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					conn, err := dialer.DialContext(ctx, "tcp6", addr)
-					if err != nil {
-						log.Warnf("codex auth ipv6 dial failed: src=%s dst=%s err=%v", ipv6Str, addr, err)
-						return nil, err
-					}
-					log.Debugf("codex auth ipv6 connected: src=%s dst=%s local=%s", ipv6Str, addr, conn.LocalAddr())
-					return conn, nil
-				},
+				DialContext: dialer.DialContext,
 			}
 			httpClient.Transport = transport
+			log.Debugf("codex auth: bound HTTP client to IPv6 %s", boundIPv6)
 		}
 	}
 
-	httpClient = util.SetProxy(&cfg.SDKConfig, httpClient)
-
 	return &CodexAuth{
-		httpClient: httpClient,
+		httpClient: util.SetProxy(&cfg.SDKConfig, httpClient),
 	}
 }
 

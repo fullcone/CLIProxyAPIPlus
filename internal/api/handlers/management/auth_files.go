@@ -27,13 +27,13 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/claude"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/copilot"
-	cfgpkg "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	geminiAuth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/gemini"
 	iflowauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/iflow"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kilo"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -293,8 +293,8 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 			}
 		}
 		if filterProvider != "" {
-			prov, _ := entry["provider"].(string)
-			if !strings.EqualFold(prov, filterProvider) {
+			p, _ := entry["provider"].(string)
+			if !strings.EqualFold(p, filterProvider) {
 				continue
 			}
 		}
@@ -843,6 +843,87 @@ func (h *Handler) PatchAuthFileStatus(c *gin.Context) {
 	}
 
 	c.JSON(http.StatusOK, gin.H{"status": "ok", "disabled": *req.Disabled})
+}
+
+// PatchAuthFileFields updates editable fields (prefix, proxy_url, priority) of an auth file.
+func (h *Handler) PatchAuthFileFields(c *gin.Context) {
+	if h.authManager == nil {
+		c.JSON(http.StatusServiceUnavailable, gin.H{"error": "core auth manager unavailable"})
+		return
+	}
+
+	var req struct {
+		Name     string  `json:"name"`
+		Prefix   *string `json:"prefix"`
+		ProxyURL *string `json:"proxy_url"`
+		Priority *int    `json:"priority"`
+	}
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "invalid request body"})
+		return
+	}
+
+	name := strings.TrimSpace(req.Name)
+	if name == "" {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "name is required"})
+		return
+	}
+
+	ctx := c.Request.Context()
+
+	// Find auth by name or ID
+	var targetAuth *coreauth.Auth
+	if auth, ok := h.authManager.GetByID(name); ok {
+		targetAuth = auth
+	} else {
+		auths := h.authManager.List()
+		for _, auth := range auths {
+			if auth.FileName == name {
+				targetAuth = auth
+				break
+			}
+		}
+	}
+
+	if targetAuth == nil {
+		c.JSON(http.StatusNotFound, gin.H{"error": "auth file not found"})
+		return
+	}
+
+	changed := false
+	if req.Prefix != nil {
+		targetAuth.Prefix = *req.Prefix
+		changed = true
+	}
+	if req.ProxyURL != nil {
+		targetAuth.ProxyURL = *req.ProxyURL
+		changed = true
+	}
+	if req.Priority != nil {
+		if targetAuth.Metadata == nil {
+			targetAuth.Metadata = make(map[string]any)
+		}
+		if *req.Priority == 0 {
+			delete(targetAuth.Metadata, "priority")
+		} else {
+			targetAuth.Metadata["priority"] = *req.Priority
+		}
+		changed = true
+	}
+
+	if !changed {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "no fields to update"})
+		return
+	}
+
+	targetAuth.UpdatedAt = time.Now()
+
+	if _, err := h.authManager.Update(ctx, targetAuth); err != nil {
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update auth: %v", err)})
+		return
+	}
+
+	c.JSON(http.StatusOK, gin.H{"status": "ok"})
 }
 
 func (h *Handler) disableAuth(ctx context.Context, id string) {
@@ -1398,31 +1479,50 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			time.Sleep(500 * time.Millisecond)
 		}
 
-		// Pre-allocate IPv6 address using temporary ID (state) so that ExchangeCodeForTokens uses it
+		// Pre-allocate IPv6 address using state as temporary ID so that token exchange also uses IPv6
 		var ipv6Addr string
-		pool := cfgpkg.GetIPv6Pool(h.cfg.IPv6Prefix)
-		if pool != nil {
-			var errIPv6 error
-			ipv6Addr, errIPv6 = pool.Assign(state)
+		ipv6Pool := config.GetIPv6Pool(h.cfg.IPv6Prefix)
+		if ipv6Pool != nil {
+			allocated, errIPv6 := ipv6Pool.Assign(state)
 			if errIPv6 != nil {
-				log.Warnf("Failed to pre-allocate IPv6 for codex OAuth (state=%s): %v", state, errIPv6)
+				log.Warnf("codex oauth: failed to pre-allocate IPv6 for state %s: %v", state, errIPv6)
 			} else {
-				log.Infof("Pre-allocated IPv6 %s for codex OAuth (state=%s)", ipv6Addr, state)
+				ipv6Addr = allocated
+				log.Infof("codex oauth: pre-allocated IPv6 %s for state %s", ipv6Addr, state)
 			}
 		}
 
-		// Create CodexAuth with IPv6 so exchange request uses the bound address
-		var exchangeAuth *codex.CodexAuth
-		if ipv6Addr != "" {
-			exchangeAuth = codex.NewCodexAuth(h.cfg, ipv6Addr)
-		} else {
-			exchangeAuth = codex.NewCodexAuth(h.cfg)
-		}
+		// Create CodexAuth with IPv6 so that ExchangeCodeForTokens uses the bound address
+		codexAuthSvc := codex.NewCodexAuth(h.cfg, ipv6Addr)
 
 		log.Debug("Authorization code received, exchanging for tokens...")
-		// Exchange code for tokens using internal auth service
-		bundle, errExchange := exchangeAuth.ExchangeCodeForTokens(ctx, code, pkceCodes)
+		// Exchange code for tokens using internal auth service (with retry for transient errors)
+		const maxExchangeAttempts = 4
+		var bundle *codex.CodexAuthBundle
+		var errExchange error
+		for attempt := 1; attempt <= maxExchangeAttempts; attempt++ {
+			bundle, errExchange = codexAuthSvc.ExchangeCodeForTokens(ctx, code, pkceCodes)
+			if errExchange == nil {
+				break
+			}
+			errMsg := errExchange.Error()
+			retryable := strings.Contains(errMsg, "EOF") ||
+				strings.Contains(errMsg, "connection reset") ||
+				strings.Contains(errMsg, "connection refused") ||
+				strings.Contains(errMsg, "timeout") ||
+				strings.Contains(errMsg, "status 5")
+			if !retryable || attempt == maxExchangeAttempts {
+				break
+			}
+			backoff := time.Duration(1<<uint(attempt)) * time.Second // 2s, 4s, 8s
+			log.Warnf("codex oauth: exchange attempt %d/%d failed (retryable): %v, retrying in %v", attempt, maxExchangeAttempts, errExchange, backoff)
+			time.Sleep(backoff)
+		}
 		if errExchange != nil {
+			// Clean up temporary IPv6 allocation on failure
+			if ipv6Pool != nil && ipv6Addr != "" {
+				ipv6Pool.Unregister(state)
+			}
 			authErr := codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, errExchange)
 			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
 			log.Errorf("Failed to exchange authorization code for tokens: %v", authErr)
@@ -1442,16 +1542,16 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		}
 
 		// Create token storage and persist
-		tokenStorage := exchangeAuth.CreateTokenStorage(bundle)
-		if ipv6Addr != "" {
-			tokenStorage.IPv6 = ipv6Addr
-		}
+		tokenStorage := codexAuthSvc.CreateTokenStorage(bundle)
 		fileName := codex.CredentialFileName(tokenStorage.Email, planType, hashAccountID, true)
 
-		// Re-register IPv6 under the permanent fileName if it differs from the temporary state ID
-		if pool != nil && ipv6Addr != "" && fileName != state {
-			pool.Unregister(state)
-			pool.Register(fileName, ipv6Addr)
+		// Re-register IPv6 under the permanent fileName if it differs from the temp state ID
+		if ipv6Pool != nil && ipv6Addr != "" {
+			if fileName != state {
+				ipv6Pool.Unregister(state)
+				ipv6Pool.Register(fileName, ipv6Addr)
+			}
+			tokenStorage.IPv6 = ipv6Addr
 		}
 
 		record := &coreauth.Auth{

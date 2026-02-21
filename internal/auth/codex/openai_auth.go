@@ -15,6 +15,7 @@ import (
 	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
@@ -37,44 +38,27 @@ type CodexAuth struct {
 }
 
 // NewCodexAuth creates a new CodexAuth service instance.
-// It initializes an HTTP client with proxy settings from the provided configuration.
-// An optional IPv6 address can be passed to bind the HTTP client to a specific source address
-// using IP_FREEBIND (for eBPF SNAT scenarios).
-func NewCodexAuth(cfg *config.Config, ipv6Addr ...string) *CodexAuth {
+// It initializes an HTTP client with optional IPv6 source binding and proxy settings from the provided configuration.
+func NewCodexAuth(cfg *config.Config, ipv6 ...string) *CodexAuth {
 	httpClient := &http.Client{}
-
-	// If a non-empty IPv6 address is provided, create a transport with IP_FREEBIND + LocalAddr.
-	var boundIPv6 string
-	if len(ipv6Addr) > 0 {
-		boundIPv6 = strings.TrimSpace(ipv6Addr[0])
+	if cfg == nil {
+		return &CodexAuth{httpClient: httpClient}
 	}
-	if boundIPv6 != "" {
-		ipv6IP := net.ParseIP(boundIPv6)
-		if ipv6IP != nil {
-			dialer := &net.Dialer{
-				LocalAddr: &net.TCPAddr{IP: ipv6IP},
-				Control: func(network, address string, c syscall.RawConn) error {
-					var opErr error
-					if err := c.Control(func(fd uintptr) {
-						// IPV6_FREEBIND = 78 on Linux (not exported by syscall package)
-						opErr = syscall.SetsockoptInt(int(fd), syscall.SOL_IPV6, 78, 1)
-					}); err != nil {
-						return err
-					}
-					return opErr
-				},
+
+	if len(ipv6) > 0 {
+		if trimmed := strings.TrimSpace(ipv6[0]); trimmed != "" {
+			if transport, err := buildCodexIPv6Transport(trimmed); err != nil {
+				log.Warnf("codex auth: failed to build ipv6 transport for %s: %v", trimmed, err)
+			} else {
+				httpClient.Transport = transport
 			}
-			transport := &http.Transport{
-				DialContext: dialer.DialContext,
-			}
-			httpClient.Transport = transport
-			log.Debugf("codex auth: bound HTTP client to IPv6 %s", boundIPv6)
 		}
 	}
 
-	return &CodexAuth{
-		httpClient: util.SetProxy(&cfg.SDKConfig, httpClient),
+	if strings.TrimSpace(cfg.ProxyURL) != "" {
+		httpClient = util.SetProxy(&cfg.SDKConfig, httpClient)
 	}
+	return &CodexAuth{httpClient: httpClient}
 }
 
 // GenerateAuthURL creates the OAuth authorization URL with PKCE (Proof Key for Code Exchange).
@@ -319,4 +303,47 @@ func (o *CodexAuth) UpdateTokenStorage(storage *CodexTokenStorage, tokenData *Co
 	storage.LastRefresh = time.Now().Format(time.RFC3339)
 	storage.Email = tokenData.Email
 	storage.Expire = tokenData.Expire
+}
+
+func buildCodexIPv6Transport(ipv6 string) (*http.Transport, error) {
+	ip := net.ParseIP(strings.TrimSpace(ipv6))
+	if ip == nil || ip.To4() != nil {
+		return nil, fmt.Errorf("invalid ipv6 address: %s", ipv6)
+	}
+	ipv6IP := ip.To16()
+	if ipv6IP == nil {
+		return nil, fmt.Errorf("invalid ipv6 address: %s", ipv6)
+	}
+
+	dialer := &net.Dialer{
+		Timeout:   30 * time.Second,
+		KeepAlive: 30 * time.Second,
+		LocalAddr: &net.TCPAddr{IP: ipv6IP},
+		Control: func(network, address string, c syscall.RawConn) error {
+			var ctrlErr error
+			freebindVal := int32(1)
+			err := c.Control(func(fd uintptr) {
+				_, _, errno := syscall.Syscall6(
+					syscall.SYS_SETSOCKOPT,
+					fd,
+					uintptr(syscall.IPPROTO_IPV6),
+					uintptr(78),
+					uintptr(unsafe.Pointer(&freebindVal)),
+					uintptr(unsafe.Sizeof(freebindVal)),
+					0,
+				)
+				if errno != 0 {
+					ctrlErr = errno
+				}
+			})
+			if err != nil {
+				return err
+			}
+			return ctrlErr
+		},
+	}
+
+	transport := &http.Transport{}
+	transport.DialContext = dialer.DialContext
+	return transport, nil
 }

@@ -39,7 +39,7 @@ var dataTag = []byte("data:")
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
 type CodexExecutor struct {
 	cfg            *config.Config
-	codexAuthCache sync.Map // key: auth.ID (string), value: *codexauth.CodexAuth
+	codexAuthCache sync.Map
 }
 
 func NewCodexExecutor(cfg *config.Config) *CodexExecutor { return &CodexExecutor{cfg: cfg} }
@@ -573,22 +573,22 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	if refreshToken == "" {
 		return auth, nil
 	}
+	cacheKey := auth.ID
+	var ipv6 string
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["ipv6"].(string); ok {
+			ipv6 = strings.TrimSpace(v)
+		}
+	}
 	var svc *codexauth.CodexAuth
-	if cached, ok := e.codexAuthCache.Load(auth.ID); ok {
-		svc = cached.(*codexauth.CodexAuth)
-	} else {
-		var ipv6Addr string
-		if auth.Metadata != nil {
-			if v, ok := auth.Metadata["ipv6"].(string); ok {
-				ipv6Addr = strings.TrimSpace(v)
-			}
+	if cached, ok := e.codexAuthCache.Load(cacheKey); ok {
+		if v, ok := cached.(*codexauth.CodexAuth); ok && v != nil {
+			svc = v
 		}
-		if ipv6Addr != "" {
-			svc = codexauth.NewCodexAuth(e.cfg, ipv6Addr)
-		} else {
-			svc = codexauth.NewCodexAuth(e.cfg)
-		}
-		e.codexAuthCache.Store(auth.ID, svc)
+	}
+	if svc == nil {
+		svc = codexauth.NewCodexAuth(e.cfg, ipv6)
+		e.codexAuthCache.Store(cacheKey, svc)
 	}
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {

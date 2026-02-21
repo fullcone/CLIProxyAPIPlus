@@ -243,13 +243,11 @@ func BuildKiroPayload(claudeBody []byte, modelID, profileArn, origin string, isA
 	// Process messages and build history
 	history, currentUserMsg, currentToolResults := processMessages(messages, modelID, origin)
 
-	// Build content with system prompt (only on first turn to avoid re-injection)
+	// Build content with system prompt.
+	// Keep thinking tags on subsequent turns so multi-turn Claude sessions
+	// continue to emit reasoning events.
 	if currentUserMsg != nil {
-		effectiveSystemPrompt := systemPrompt
-		if len(history) > 0 {
-			effectiveSystemPrompt = "" // Don't re-inject on subsequent turns
-		}
-		currentUserMsg.Content = buildFinalContent(currentUserMsg.Content, effectiveSystemPrompt, currentToolResults)
+		currentUserMsg.Content = buildFinalContent(currentUserMsg.Content, systemPrompt, currentToolResults)
 
 		// Deduplicate currentToolResults
 		currentToolResults = deduplicateToolResults(currentToolResults)
@@ -475,6 +473,15 @@ func IsThinkingEnabledWithHeaders(body []byte, headers http.Header) bool {
 		}
 	}
 
+	// Check model name directly for thinking hints.
+	// This enables thinking variants even when clients don't send explicit thinking fields.
+	model := strings.TrimSpace(gjson.GetBytes(body, "model").String())
+	modelLower := strings.ToLower(model)
+	if strings.Contains(modelLower, "thinking") || strings.Contains(modelLower, "-reason") {
+		log.Debugf("kiro: thinking mode enabled via model name hint: %s", model)
+		return true
+	}
+
 	log.Debugf("kiro: IsThinkingEnabled returning false (no thinking mode detected)")
 	return false
 }
@@ -680,11 +687,10 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 				if len(ctx.ToolResults) == 0 && len(ctx.Tools) == 0 {
 					h.UserInputMessage.UserInputMessageContext = nil
 				}
-				// Content fallback: if all tool_results were removed by orphan filtering
-				// but content still says "Tool results provided.", revert to generic default.
-				if len(ctx.ToolResults) == 0 && strings.TrimSpace(h.UserInputMessage.Content) == kirocommon.DefaultUserContentWithToolResults {
+				if len(ctx.ToolResults) == 0 &&
+					strings.TrimSpace(h.UserInputMessage.Content) == strings.TrimSpace(kirocommon.DefaultUserContentWithToolResults) {
 					h.UserInputMessage.Content = kirocommon.DefaultUserContent
-					log.Debugf("kiro: history[%d] content reverted from DefaultUserContentWithToolResults to DefaultUserContent after orphan filtering", i)
+					log.Debugf("kiro: fallback history[%d] content after orphan filtering: %s -> %s", i, kirocommon.DefaultUserContentWithToolResults, kirocommon.DefaultUserContent)
 				}
 			}
 		}
@@ -706,11 +712,10 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 		currentToolResults = filtered
 	}
 
-	// Content fallback for currentMessage: if all tool_results were removed by orphan filtering
-	// but content still says "Tool results provided.", revert to generic default.
-	if currentUserMsg != nil && len(currentToolResults) == 0 && strings.TrimSpace(currentUserMsg.Content) == kirocommon.DefaultUserContentWithToolResults {
+	if currentUserMsg != nil && len(currentToolResults) == 0 &&
+		strings.TrimSpace(currentUserMsg.Content) == strings.TrimSpace(kirocommon.DefaultUserContentWithToolResults) {
 		currentUserMsg.Content = kirocommon.DefaultUserContent
-		log.Debugf("kiro: currentMessage content reverted from DefaultUserContentWithToolResults to DefaultUserContent after orphan filtering")
+		log.Debugf("kiro: fallback currentMessage content after orphan filtering: %s -> %s", kirocommon.DefaultUserContentWithToolResults, kirocommon.DefaultUserContent)
 	}
 
 	return history, currentUserMsg, currentToolResults

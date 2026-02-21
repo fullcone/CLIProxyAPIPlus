@@ -15,6 +15,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
@@ -752,42 +753,46 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		}).DialContext,
 	}
 
-	// Check for IPv6 source address binding (Codex per-account IPv6).
-	var ipv6Addr string
 	if auth != nil && auth.Metadata != nil {
-		if v, ok := auth.Metadata["ipv6"].(string); ok {
-			ipv6Addr = strings.TrimSpace(v)
-		}
-	}
-	if ipv6Addr != "" {
-		ipv6IP := net.ParseIP(ipv6Addr)
-		if ipv6IP != nil {
-			ipv6Dialer := &net.Dialer{
-				LocalAddr: &net.TCPAddr{IP: ipv6IP},
-				Timeout:   30 * time.Second,
-				KeepAlive: 30 * time.Second,
-				Control: func(network, address string, c syscall.RawConn) error {
-					var opErr error
-					if err := c.Control(func(fd uintptr) {
-						// IPV6_FREEBIND = 78 on Linux (not exported by syscall package)
-						opErr = syscall.SetsockoptInt(int(fd), syscall.SOL_IPV6, 78, 1)
-					}); err != nil {
-						return err
+		if raw, ok := auth.Metadata["ipv6"]; ok {
+			if ipv6, okCast := raw.(string); okCast {
+				if ipv6 = strings.TrimSpace(ipv6); ipv6 != "" {
+					if ip := net.ParseIP(ipv6); ip != nil && ip.To4() == nil {
+						ipv6IP := ip.To16()
+						if ipv6IP != nil {
+							dialer.Proxy = http.ProxyFromEnvironment
+							dialer.NetDialContext = (&net.Dialer{
+								Timeout:   30 * time.Second,
+								KeepAlive: 30 * time.Second,
+								LocalAddr: &net.TCPAddr{IP: ipv6IP},
+								Control: func(network, address string, c syscall.RawConn) error {
+									var ctrlErr error
+									freebindVal := int32(1)
+									err := c.Control(func(fd uintptr) {
+										_, _, errno := syscall.Syscall6(
+											syscall.SYS_SETSOCKOPT,
+											fd,
+											uintptr(syscall.IPPROTO_IPV6),
+											uintptr(78),
+											uintptr(unsafe.Pointer(&freebindVal)),
+											uintptr(unsafe.Sizeof(freebindVal)),
+											0,
+										)
+										if errno != 0 {
+											ctrlErr = errno
+										}
+									})
+									if err != nil {
+										return err
+									}
+									return ctrlErr
+								},
+							}).DialContext
+							return dialer
+						}
 					}
-					return opErr
-				},
-			}
-			dialer.Proxy = nil
-			dialer.NetDialContext = func(dialCtx context.Context, network, addr string) (net.Conn, error) {
-				conn, err := ipv6Dialer.DialContext(dialCtx, network, addr)
-				if err != nil {
-					log.Warnf("ipv6 ws dial failed: src=%s dst=%s err=%v", ipv6Addr, addr, err)
-					return nil, err
 				}
-				log.Debugf("ipv6 ws dial ok: src=%s dst=%s local=%s", ipv6Addr, addr, conn.LocalAddr())
-				return conn, nil
 			}
-			return dialer
 		}
 	}
 

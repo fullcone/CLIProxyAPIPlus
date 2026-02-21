@@ -94,6 +94,9 @@ type Config struct {
 	// Codex defines a list of Codex API key configurations as specified in the YAML configuration file.
 	CodexKey []CodexKey `yaml:"codex-api-key" json:"codex-api-key"`
 
+	// IPv6Prefix defines the IPv6 CIDR prefix used to allocate fixed source IPv6 addresses for Codex accounts.
+	IPv6Prefix string `yaml:"ipv6-prefix" json:"ipv6-prefix"`
+
 	// ClaudeKey defines a list of Claude API key configurations as specified in the YAML configuration file.
 	ClaudeKey []ClaudeKey `yaml:"claude-api-key" json:"claude-api-key"`
 
@@ -125,12 +128,6 @@ type Config struct {
 
 	// Payload defines default and override rules for provider payload parameters.
 	Payload PayloadConfig `yaml:"payload" json:"payload"`
-
-	// IPv6Prefix is the IPv6 CIDR prefix used for per-account source address binding.
-	// When set, each Codex OAuth account is assigned a unique IPv6 address from this prefix.
-	// The eBPF SNAT layer on the host uses the source IPv6 to route traffic.
-	// Example: "2607:8700:5501:979f::2/64"
-	IPv6Prefix string `yaml:"ipv6-prefix" json:"ipv6-prefix"`
 
 	// IncognitoBrowser enables opening OAuth URLs in incognito/private browsing mode.
 	// This is useful when you want to login with a different account without logging out
@@ -320,6 +317,10 @@ type CloakConfig struct {
 	// SensitiveWords is a list of words to obfuscate with zero-width characters.
 	// This can help bypass certain content filters.
 	SensitiveWords []string `yaml:"sensitive-words,omitempty" json:"sensitive-words,omitempty"`
+
+	// CacheUserID controls whether Claude user_id values are cached per API key.
+	// When false, a fresh random user_id is generated for every request.
+	CacheUserID *bool `yaml:"cache-user-id,omitempty" json:"cache-user-id,omitempty"`
 }
 
 // ClaudeKey represents the configuration for a Claude API key,
@@ -765,22 +766,24 @@ func (cfg *Config) SanitizeOAuthModelAlias() {
 		return
 	}
 
-	// Inject default Kiro aliases if no user-configured kiro aliases exist
+	// Inject channel defaults when the channel is absent in user config.
+	// Presence is checked case-insensitively and includes explicit nil/empty markers.
 	if cfg.OAuthModelAlias == nil {
 		cfg.OAuthModelAlias = make(map[string][]OAuthModelAlias)
 	}
-	if _, hasKiro := cfg.OAuthModelAlias["kiro"]; !hasKiro {
-		// Check case-insensitive too
-		found := false
+	hasChannel := func(channel string) bool {
 		for k := range cfg.OAuthModelAlias {
-			if strings.EqualFold(strings.TrimSpace(k), "kiro") {
-				found = true
-				break
+			if strings.EqualFold(strings.TrimSpace(k), channel) {
+				return true
 			}
 		}
-		if !found {
-			cfg.OAuthModelAlias["kiro"] = defaultKiroAliases()
-		}
+		return false
+	}
+	if !hasChannel("kiro") {
+		cfg.OAuthModelAlias["kiro"] = defaultKiroAliases()
+	}
+	if !hasChannel("github-copilot") {
+		cfg.OAuthModelAlias["github-copilot"] = defaultGitHubCopilotAliases()
 	}
 
 	if len(cfg.OAuthModelAlias) == 0 {

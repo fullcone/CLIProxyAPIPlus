@@ -33,7 +33,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
-	internalconfig "github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
@@ -264,37 +264,39 @@ func (h *Handler) ListAuthFiles(c *gin.Context) {
 		return
 	}
 	auths := h.authManager.List()
-
-	// Optional query filters.
-	filterStatus := strings.TrimSpace(c.Query("status"))
-	filterUnavailable := strings.TrimSpace(c.Query("unavailable"))
-	filterProvider := strings.TrimSpace(c.Query("provider"))
-
+	statusFilter := strings.TrimSpace(c.Query("status"))
+	unavailableFilter := strings.TrimSpace(c.Query("unavailable"))
+	providerFilter := strings.TrimSpace(c.Query("provider"))
+	hasUnavailableFilter := false
+	wantUnavailable := false
+	if strings.EqualFold(unavailableFilter, "true") {
+		hasUnavailableFilter = true
+		wantUnavailable = true
+	} else if strings.EqualFold(unavailableFilter, "false") {
+		hasUnavailableFilter = true
+	}
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
 		entry := h.buildAuthFileEntry(auth)
 		if entry == nil {
 			continue
 		}
-		if filterStatus != "" {
-			sm, _ := entry["status_message"].(string)
-			st, _ := entry["status"].(string)
-			if !strings.EqualFold(sm, filterStatus) && !strings.EqualFold(st, filterStatus) {
+		if statusFilter != "" {
+			statusMessage, _ := entry["status_message"].(string)
+			status := strings.TrimSpace(fmt.Sprint(entry["status"]))
+			if !strings.EqualFold(statusFilter, statusMessage) && !strings.EqualFold(statusFilter, status) {
 				continue
 			}
 		}
-		if filterUnavailable != "" {
-			ua, _ := entry["unavailable"].(bool)
-			if filterUnavailable == "true" && !ua {
-				continue
-			}
-			if filterUnavailable == "false" && ua {
+		if hasUnavailableFilter {
+			unavailable, ok := entry["unavailable"].(bool)
+			if !ok || unavailable != wantUnavailable {
 				continue
 			}
 		}
-		if filterProvider != "" {
-			p, _ := entry["provider"].(string)
-			if !strings.EqualFold(p, filterProvider) {
+		if providerFilter != "" {
+			provider := strings.TrimSpace(fmt.Sprint(entry["provider"]))
+			if !strings.EqualFold(providerFilter, provider) {
 				continue
 			}
 		}
@@ -1409,10 +1411,10 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 	}
 
 	// Initialize Codex auth service
-	openaiAuth := codex.NewCodexAuth(h.cfg)
+	codexAuth := codex.NewCodexAuth(h.cfg)
 
 	// Generate authorization URL
-	authURL, err := openaiAuth.GenerateAuthURL(state, pkceCodes)
+	authURL, err := codexAuth.GenerateAuthURL(state, pkceCodes)
 	if err != nil {
 		log.Errorf("Failed to generate authorization URL: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
@@ -1479,48 +1481,50 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 			time.Sleep(500 * time.Millisecond)
 		}
 
-		// Pre-allocate IPv6 address before token exchange so the exchange request also uses IPv6.
-		var ipv6Str string
-		ipv6Pool := internalconfig.GetIPv6Pool(h.cfg.IPv6Prefix)
-		if ipv6Pool != nil {
-			ipv6IP, errIPv6 := ipv6Pool.Assign(state)
-			if errIPv6 != nil {
-				log.Warnf("codex oauth: failed to pre-allocate IPv6 for state %s: %v", state, errIPv6)
-			} else {
-				ipv6Str = ipv6IP.String()
-				log.Infof("codex oauth: pre-allocated IPv6 %s for state %s", ipv6Str, state)
+		log.Debug("Authorization code received, exchanging for tokens...")
+		pool := config.GetIPv6Pool(strings.TrimSpace(h.cfg.IPv6Prefix))
+		assignedIPv6 := ""
+		if pool != nil {
+			ipv6, errAssign := pool.Assign(state)
+			if errAssign != nil {
+				SetOAuthSessionError(state, "Failed to assign IPv6 for Codex account")
+				log.Errorf("codex oauth: failed to assign ipv6 for state %s: %v", state, errAssign)
+				return
 			}
+			assignedIPv6 = ipv6
 		}
 
-		log.Debug("Authorization code received, exchanging for tokens...")
-		// Exchange code for tokens using internal auth service (with retry for transient errors)
-		// If IPv6 is available, create a new CodexAuth bound to that address.
-		var exchangeAuth *codex.CodexAuth
-		if ipv6Str != "" {
-			exchangeAuth = codex.NewCodexAuth(h.cfg, ipv6Str)
-		} else {
-			exchangeAuth = openaiAuth
+		exchangeAuth := codexAuth
+		if assignedIPv6 != "" {
+			exchangeAuth = codex.NewCodexAuth(h.cfg, assignedIPv6)
 		}
+
+		// Exchange code for tokens using internal auth service
+		var (
+			bundle      *codex.CodexAuthBundle
+			errExchange error
+		)
 		const maxExchangeAttempts = 4
-		var bundle *codex.CodexAuthBundle
-		var errExchange error
 		for attempt := 1; attempt <= maxExchangeAttempts; attempt++ {
 			bundle, errExchange = exchangeAuth.ExchangeCodeForTokens(ctx, code, pkceCodes)
 			if errExchange == nil {
 				break
 			}
+
 			errMsg := errExchange.Error()
+			errMsgLower := strings.ToLower(errMsg)
 			retryable := strings.Contains(errMsg, "EOF") ||
-				strings.Contains(errMsg, "connection reset") ||
-				strings.Contains(errMsg, "connection refused") ||
-				strings.Contains(errMsg, "timeout") ||
-				strings.Contains(errMsg, "status 5")
+				strings.Contains(errMsgLower, "connection reset") ||
+				strings.Contains(errMsgLower, "connection refused") ||
+				strings.Contains(errMsgLower, "timeout") ||
+				strings.Contains(errMsgLower, "status 5")
 			if !retryable || attempt == maxExchangeAttempts {
 				break
 			}
-			backoff := time.Duration(1<<uint(attempt)) * time.Second // 2s, 4s, 8s
-			log.Warnf("codex oauth: exchange attempt %d/%d failed (retryable): %v, retrying in %v", attempt, maxExchangeAttempts, errExchange, backoff)
-			time.Sleep(backoff)
+
+			delay := time.Duration(1<<attempt) * time.Second
+			log.Warnf("codex oauth: exchange attempt %d/%d failed (retryable): %v, retrying in %v", attempt, maxExchangeAttempts, errExchange, delay)
+			time.Sleep(delay)
 		}
 		if errExchange != nil {
 			authErr := codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, errExchange)
@@ -1543,30 +1547,29 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 
 		// Create token storage and persist
 		tokenStorage := exchangeAuth.CreateTokenStorage(bundle)
-
-		// Assign IPv6 to the permanent fileName and update token storage.
 		fileName := codex.CredentialFileName(tokenStorage.Email, planType, hashAccountID, true)
-		if ipv6Pool != nil && ipv6Str != "" {
-			// Re-register the IPv6 under the permanent fileName if it differs from the temp state ID.
-			if fileName != state {
-				ipv6Pool.Unregister(state)
-				ipv6Pool.Register(fileName, net.ParseIP(ipv6Str))
+		if pool != nil && assignedIPv6 != "" && fileName != state {
+			pool.Unregister(state)
+			if errRegister := pool.Register(fileName, assignedIPv6); errRegister != nil {
+				SetOAuthSessionError(state, "Failed to bind IPv6 to Codex account")
+				log.Errorf("codex oauth: failed to rebind ipv6 state=%s file=%s ipv6=%s err=%v", state, fileName, assignedIPv6, errRegister)
+				return
 			}
-			tokenStorage.IPv6 = ipv6Str
 		}
-
+		tokenStorage.IPv6 = assignedIPv6
+		recordMetadata := map[string]any{
+			"email":      tokenStorage.Email,
+			"account_id": tokenStorage.AccountID,
+		}
+		if assignedIPv6 != "" {
+			recordMetadata["ipv6"] = assignedIPv6
+		}
 		record := &coreauth.Auth{
 			ID:       fileName,
 			Provider: "codex",
 			FileName: fileName,
 			Storage:  tokenStorage,
-			Metadata: map[string]any{
-				"email":      tokenStorage.Email,
-				"account_id": tokenStorage.AccountID,
-			},
-		}
-		if ipv6Str != "" {
-			record.Metadata["ipv6"] = ipv6Str
+			Metadata: recordMetadata,
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
@@ -2960,7 +2963,7 @@ func (h *Handler) RequestKiloToken(c *gin.Context) {
 			Metadata: map[string]any{
 				"email":           status.UserEmail,
 				"organization_id": orgID,
-				"model":          defaults.Model,
+				"model":           defaults.Model,
 			},
 		}
 

@@ -626,6 +626,7 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 }
 
 func (e *CodexWebsocketsExecutor) dialCodexWebsocket(ctx context.Context, auth *cliproxyauth.Auth, wsURL string, headers http.Header) (*websocket.Conn, *http.Response, error) {
+	logCodexNetworkDecision("websocket", wsURL, resolveNetworkRouteDecision(e.cfg, auth))
 	dialer := newProxyAwareWebsocketDialer(e.cfg, auth)
 	dialer.HandshakeTimeout = codexResponsesWebsocketHandshakeTO
 	dialer.EnableCompression = true
@@ -756,23 +757,10 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		}).DialContext,
 	}
 
-	proxyURL := ""
-	ipv6Addr := ""
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-		if auth.Metadata != nil {
-			if v, ok := auth.Metadata["ipv6"].(string); ok {
-				ipv6Addr = strings.TrimSpace(v)
-			}
-		}
-	}
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
-	if proxyURL == "" {
-		if ipv6Addr == "" {
-			return dialer
-		}
+	decision := resolveNetworkRouteDecision(cfg, auth)
+	proxyURL := decision.rawProxyURL
+	ipv6Addr := decision.ipv6Addr
+	if decision.routeMode == codexNetModeDirectIPv6Freebind {
 		ipv6Dialer, errIPv6 := util.NewIPv6Dialer(ipv6Addr, 30*time.Second, 30*time.Second)
 		if errIPv6 != nil {
 			log.Warnf("codex websockets executor: ipv6 dialer setup failed: %v", errIPv6)
@@ -782,6 +770,9 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 		dialer.NetDialContext = func(ctx context.Context, network, addr string) (net.Conn, error) {
 			return ipv6Dialer.DialContext(ctx, "tcp6", addr)
 		}
+		return dialer
+	}
+	if decision.proxyMode == proxyutil.ModeInherit {
 		return dialer
 	}
 

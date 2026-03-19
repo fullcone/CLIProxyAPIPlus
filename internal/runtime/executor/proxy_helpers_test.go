@@ -28,3 +28,24 @@ func TestNewProxyAwareHTTPClientDirectBypassesGlobalProxy(t *testing.T) {
 		t.Fatal("expected direct transport to disable proxy function")
 	}
 }
+
+func TestResolveNetworkRouteDecisionDirectStillUsesIPv6(t *testing.T) {
+	t.Parallel()
+
+	decision := resolveNetworkRouteDecision(
+		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}},
+		&cliproxyauth.Auth{
+			ID: "auth-1",
+			Metadata: map[string]any{
+				"ipv6": "2001:db8::10",
+			},
+		},
+	)
+
+	if decision.proxyOrigin != codexNetOriginDefault {
+		t.Fatalf("proxy origin = %s, want %s", decision.proxyOrigin, codexNetOriginDefault)
+	}
+	if decision.routeMode != codexNetModeDirectIPv6Freebind {
+		t.Fatalf("route mode = %s, want %s", decision.routeMode, codexNetModeDirectIPv6Freebind)
+	}
+}

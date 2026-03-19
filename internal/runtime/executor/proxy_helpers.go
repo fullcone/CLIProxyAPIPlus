@@ -20,6 +20,92 @@ var (
 	httpClientCacheMutex sync.RWMutex
 )
 
+const (
+	codexNetOriginInherit  = "proxy-inherit"
+	codexNetOriginExplicit = "proxy-explicit"
+	codexNetOriginDefault  = "proxy-default"
+
+	codexNetModeDirectDefault      = "direct-default"
+	codexNetModeDirectIPv6Freebind = "direct-ipv6-freebind"
+	codexNetModeProxyExplicit      = "proxy-explicit"
+	codexNetModeProxyDefault       = "proxy-default"
+	codexNetModeProxyInvalid       = "proxy-invalid-fallback"
+)
+
+type networkRouteDecision struct {
+	rawProxyURL string
+	proxyOrigin string
+	proxyMode   proxyutil.Mode
+	routeMode   string
+	authID      string
+	ipv6Addr    string
+}
+
+func resolveNetworkRouteDecision(cfg *config.Config, auth *cliproxyauth.Auth) networkRouteDecision {
+	decision := networkRouteDecision{
+		proxyOrigin: codexNetOriginInherit,
+		proxyMode:   proxyutil.ModeInherit,
+		routeMode:   codexNetModeDirectDefault,
+	}
+	if auth != nil {
+		decision.authID = strings.TrimSpace(auth.ID)
+		if auth.Metadata != nil {
+			if v, ok := auth.Metadata["ipv6"].(string); ok {
+				decision.ipv6Addr = strings.TrimSpace(v)
+			}
+		}
+		if raw := strings.TrimSpace(auth.ProxyURL); raw != "" {
+			decision.rawProxyURL = raw
+			decision.proxyOrigin = codexNetOriginExplicit
+		}
+	}
+	if decision.rawProxyURL == "" && cfg != nil {
+		if raw := strings.TrimSpace(cfg.ProxyURL); raw != "" {
+			decision.rawProxyURL = raw
+			decision.proxyOrigin = codexNetOriginDefault
+		}
+	}
+	if decision.rawProxyURL != "" {
+		setting, errParse := proxyutil.Parse(decision.rawProxyURL)
+		if errParse != nil {
+			decision.proxyMode = proxyutil.ModeInvalid
+			decision.routeMode = codexNetModeProxyInvalid
+			return decision
+		}
+		decision.proxyMode = setting.Mode
+	}
+	switch decision.proxyMode {
+	case proxyutil.ModeProxy:
+		if decision.proxyOrigin == codexNetOriginExplicit {
+			decision.routeMode = codexNetModeProxyExplicit
+		} else {
+			decision.routeMode = codexNetModeProxyDefault
+		}
+	case proxyutil.ModeDirect, proxyutil.ModeInherit:
+		if decision.ipv6Addr != "" {
+			decision.routeMode = codexNetModeDirectIPv6Freebind
+		} else {
+			decision.routeMode = codexNetModeDirectDefault
+		}
+	default:
+		decision.routeMode = codexNetModeProxyInvalid
+	}
+	return decision
+}
+
+func logCodexNetworkDecision(scope, target string, decision networkRouteDecision) {
+	log.Debugf(
+		"codex-net-scope=%s codex-net-mode=%s codex-net-origin=%s auth=%s target=%s ipv6=%s raw_proxy=%q",
+		strings.TrimSpace(scope),
+		decision.routeMode,
+		decision.proxyOrigin,
+		decision.authID,
+		strings.TrimSpace(target),
+		decision.ipv6Addr,
+		decision.rawProxyURL,
+	)
+}
+
 // newProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
 // 1. Use auth.ProxyURL if configured (highest priority)
 // 2. Use cfg.ProxyURL if auth proxy is not configured
@@ -36,24 +122,10 @@ var (
 // Returns:
 //   - *http.Client: An HTTP client with configured proxy or transport
 func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
-	// Priority 1: Use auth.ProxyURL if configured
-	var proxyURL string
-	var authID string
-	var ipv6Addr string
-	if auth != nil {
-		proxyURL = strings.TrimSpace(auth.ProxyURL)
-		authID = strings.TrimSpace(auth.ID)
-		if auth.Metadata != nil {
-			if v, ok := auth.Metadata["ipv6"].(string); ok {
-				ipv6Addr = strings.TrimSpace(v)
-			}
-		}
-	}
-
-	// Priority 2: Use cfg.ProxyURL if auth proxy is not configured
-	if proxyURL == "" && cfg != nil {
-		proxyURL = strings.TrimSpace(cfg.ProxyURL)
-	}
+	decision := resolveNetworkRouteDecision(cfg, auth)
+	authID := decision.authID
+	ipv6Addr := decision.ipv6Addr
+	proxyURL := decision.rawProxyURL
 
 	// Build cache key from proxy URL and auth ID so different auths do not
 	// accidentally share the same connection pool when routed through one proxy.
@@ -83,8 +155,7 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		httpClient.Timeout = timeout
 	}
 
-	// If we have a proxy URL configured, set up the transport
-	if proxyURL != "" {
+	if decision.proxyMode == proxyutil.ModeProxy {
 		transport := buildProxyTransport(proxyURL)
 		if transport != nil {
 			httpClient.Transport = transport
@@ -97,7 +168,7 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		// If proxy setup failed, log and fall through to context RoundTripper
 		log.Debugf("failed to setup proxy from URL: %s, falling back to context transport", proxyURL)
 	}
-	if proxyURL == "" && ipv6Addr != "" {
+	if decision.routeMode == codexNetModeDirectIPv6Freebind {
 		transport, errIPv6 := util.NewIPv6Transport(ipv6Addr)
 		if errIPv6 == nil {
 			httpClient.Transport = transport
@@ -108,6 +179,13 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		}
 		log.Warnf("failed to setup ipv6 transport for %s: %v", ipv6Addr, errIPv6)
 	}
+	if decision.proxyMode == proxyutil.ModeDirect {
+		httpClient.Transport = proxyutil.NewDirectTransport()
+		httpClientCacheMutex.Lock()
+		httpClientCache[cacheKey] = httpClient
+		httpClientCacheMutex.Unlock()
+		return httpClient
+	}
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
 	if rt, ok := ctx.Value("cliproxy.roundtripper").(http.RoundTripper); ok && rt != nil {
@@ -115,7 +193,7 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 	}
 
 	// Cache the client for no-proxy case
-	if proxyURL == "" {
+	if decision.proxyMode != proxyutil.ModeProxy {
 		httpClientCacheMutex.Lock()
 		httpClientCache[cacheKey] = httpClient
 		httpClientCacheMutex.Unlock()

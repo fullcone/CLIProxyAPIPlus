@@ -201,3 +201,23 @@ func TestNewProxyAwareWebsocketDialerDirectDisablesProxy(t *testing.T) {
 		t.Fatal("expected websocket proxy function to be nil for direct mode")
 	}
 }
+
+func TestNewProxyAwareWebsocketDialerDirectWithIPv6UsesCustomDialer(t *testing.T) {
+	t.Parallel()
+
+	dialer := newProxyAwareWebsocketDialer(
+		&config.Config{SDKConfig: sdkconfig.SDKConfig{ProxyURL: "direct"}},
+		&cliproxyauth.Auth{
+			Metadata: map[string]any{
+				"ipv6": "2001:db8::20",
+			},
+		},
+	)
+
+	if dialer.Proxy != nil {
+		t.Fatal("expected websocket proxy function to be nil for direct ipv6 mode")
+	}
+	if dialer.NetDialContext == nil {
+		t.Fatal("expected websocket dialer to use custom ipv6 dialer")
+	}
+}

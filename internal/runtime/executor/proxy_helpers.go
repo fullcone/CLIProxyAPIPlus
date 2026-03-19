@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -37,8 +38,16 @@ var (
 func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *cliproxyauth.Auth, timeout time.Duration) *http.Client {
 	// Priority 1: Use auth.ProxyURL if configured
 	var proxyURL string
+	var authID string
+	var ipv6Addr string
 	if auth != nil {
 		proxyURL = strings.TrimSpace(auth.ProxyURL)
+		authID = strings.TrimSpace(auth.ID)
+		if auth.Metadata != nil {
+			if v, ok := auth.Metadata["ipv6"].(string); ok {
+				ipv6Addr = strings.TrimSpace(v)
+			}
+		}
 	}
 
 	// Priority 2: Use cfg.ProxyURL if auth proxy is not configured
@@ -46,8 +55,12 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
-	// Build cache key from proxy URL (empty string for no proxy)
-	cacheKey := proxyURL
+	// Build cache key from proxy URL and auth ID so different auths do not
+	// accidentally share the same connection pool when routed through one proxy.
+	cacheKey := proxyURL + "|" + authID
+	if ipv6Addr != "" {
+		cacheKey += "|ipv6:" + ipv6Addr
+	}
 
 	// Check cache first
 	httpClientCacheMutex.RLock()
@@ -83,6 +96,17 @@ func newProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		}
 		// If proxy setup failed, log and fall through to context RoundTripper
 		log.Debugf("failed to setup proxy from URL: %s, falling back to context transport", proxyURL)
+	}
+	if proxyURL == "" && ipv6Addr != "" {
+		transport, errIPv6 := util.NewIPv6Transport(ipv6Addr)
+		if errIPv6 == nil {
+			httpClient.Transport = transport
+			httpClientCacheMutex.Lock()
+			httpClientCache[cacheKey] = httpClient
+			httpClientCacheMutex.Unlock()
+			return httpClient
+		}
+		log.Warnf("failed to setup ipv6 transport for %s: %v", ipv6Addr, errIPv6)
 	}
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)

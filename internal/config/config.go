@@ -40,6 +40,8 @@ type Config struct {
 
 	// AuthDir is the directory where authentication token files are stored.
 	AuthDir string `yaml:"auth-dir" json:"-"`
+	// IPv6Prefix defines the IPv6 CIDR prefix used for Codex account source binding.
+	IPv6Prefix string `yaml:"ipv6-prefix" json:"ipv6-prefix"`
 
 	// Debug enables or disables debug-level logging and other debug features.
 	Debug bool `yaml:"debug" json:"debug"`
@@ -669,6 +671,7 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.Pprof.Addr == "" {
 		cfg.Pprof.Addr = DefaultPprofAddr
 	}
+	cfg.IPv6Prefix = strings.TrimSpace(cfg.IPv6Prefix)
 
 	if cfg.LogsMaxTotalSizeMB < 0 {
 		cfg.LogsMaxTotalSizeMB = 0

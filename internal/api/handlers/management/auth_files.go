@@ -38,6 +38,7 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
@@ -243,18 +244,72 @@ func (h *Handler) managementCallbackURL(path string) (string, error) {
 	return fmt.Sprintf("%s://127.0.0.1:%d%s", scheme, h.cfg.Port, path), nil
 }
 
+func parseAuthFileFilters(c *gin.Context) (string, string, *bool, error) {
+	if c == nil {
+		return "", "", nil, fmt.Errorf("context unavailable")
+	}
+	statusFilter := strings.TrimSpace(c.Query("status"))
+	providerFilter := strings.TrimSpace(c.Query("provider"))
+	unavailableRaw := strings.TrimSpace(c.Query("unavailable"))
+	var unavailableFilter *bool
+	if unavailableRaw != "" {
+		switch strings.ToLower(unavailableRaw) {
+		case "true":
+			val := true
+			unavailableFilter = &val
+		case "false":
+			val := false
+			unavailableFilter = &val
+		default:
+			return "", "", nil, fmt.Errorf("unavailable must be true or false")
+		}
+	}
+	return statusFilter, providerFilter, unavailableFilter, nil
+}
+
+func matchesAuthFileFilters(statusFilter, providerFilter string, unavailableFilter *bool, statusValue, statusMessageValue, providerValue string, unavailableValue bool) bool {
+	if statusFilter != "" {
+		statusValue = strings.TrimSpace(statusValue)
+		statusMessageValue = strings.TrimSpace(statusMessageValue)
+		if !strings.EqualFold(statusFilter, statusValue) && !strings.EqualFold(statusFilter, statusMessageValue) {
+			return false
+		}
+	}
+	if providerFilter != "" {
+		providerValue = strings.TrimSpace(providerValue)
+		if !strings.EqualFold(providerFilter, providerValue) {
+			return false
+		}
+	}
+	if unavailableFilter != nil && unavailableValue != *unavailableFilter {
+		return false
+	}
+	return true
+}
+
 func (h *Handler) ListAuthFiles(c *gin.Context) {
 	if h == nil {
 		c.JSON(500, gin.H{"error": "handler not initialized"})
 		return
 	}
+	statusFilter, providerFilter, unavailableFilter, err := parseAuthFileFilters(c)
+	if err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
+		return
+	}
 	if h.authManager == nil {
-		h.listAuthFilesFromDisk(c)
+		h.listAuthFilesFromDisk(c, statusFilter, providerFilter, unavailableFilter)
 		return
 	}
 	auths := h.authManager.List()
 	files := make([]gin.H, 0, len(auths))
 	for _, auth := range auths {
+		if auth == nil {
+			continue
+		}
+		if !matchesAuthFileFilters(statusFilter, providerFilter, unavailableFilter, string(auth.Status), auth.StatusMessage, auth.Provider, auth.Unavailable) {
+			continue
+		}
 		if entry := h.buildAuthFileEntry(auth); entry != nil {
 			files = append(files, entry)
 		}
@@ -316,13 +371,14 @@ func (h *Handler) GetAuthFileModels(c *gin.Context) {
 }
 
 // List auth files from disk when the auth manager is unavailable.
-func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
+func (h *Handler) listAuthFilesFromDisk(c *gin.Context, statusFilter, providerFilter string, unavailableFilter *bool) {
 	entries, err := os.ReadDir(h.cfg.AuthDir)
 	if err != nil {
 		c.JSON(500, gin.H{"error": fmt.Sprintf("failed to read auth dir: %v", err)})
 		return
 	}
 	files := make([]gin.H, 0)
+	needsFilter := statusFilter != "" || providerFilter != "" || unavailableFilter != nil
 	for _, e := range entries {
 		if e.IsDir() {
 			continue
@@ -336,11 +392,37 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 
 			// Read file to get type field
 			full := filepath.Join(h.cfg.AuthDir, name)
-			if data, errRead := os.ReadFile(full); errRead == nil {
-				typeValue := gjson.GetBytes(data, "type").String()
-				emailValue := gjson.GetBytes(data, "email").String()
+			var statusValue string
+			var statusMessageValue string
+			var providerValue string
+			var unavailableValue bool
+			var typeValue string
+			var emailValue string
+			var data []byte
+			if raw, errRead := os.ReadFile(full); errRead == nil {
+				data = raw
+				typeValue = gjson.GetBytes(data, "type").String()
+				emailValue = gjson.GetBytes(data, "email").String()
+				statusValue = gjson.GetBytes(data, "status").String()
+				statusMessageValue = gjson.GetBytes(data, "status_message").String()
+				providerValue = gjson.GetBytes(data, "provider").String()
+				if providerValue == "" {
+					providerValue = typeValue
+				}
+				unavailableValue = gjson.GetBytes(data, "unavailable").Bool()
+			} else if needsFilter {
+				continue
+			}
+			if !matchesAuthFileFilters(statusFilter, providerFilter, unavailableFilter, statusValue, statusMessageValue, providerValue, unavailableValue) {
+				continue
+			}
+			if typeValue != "" {
 				fileData["type"] = typeValue
+			}
+			if emailValue != "" {
 				fileData["email"] = emailValue
+			}
+			if len(data) > 0 {
 				if pv := gjson.GetBytes(data, "priority"); pv.Exists() {
 					switch pv.Type {
 					case gjson.Number:
@@ -357,7 +439,6 @@ func (h *Handler) listAuthFilesFromDisk(c *gin.Context) {
 					}
 				}
 			}
-
 			files = append(files, fileData)
 		}
 	}
@@ -1652,8 +1733,11 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		return
 	}
 
+	reservationKey := codexOAuthReservationKey(state)
+	exchangeIPv6 := reserveCodexOAuthIPv6(h.cfg, reservationKey)
+
 	// Initialize Codex auth service
-	openaiAuth := codex.NewCodexAuth(h.cfg)
+	openaiAuth := codex.NewCodexAuth(h.cfg, exchangeIPv6)
 
 	// Generate authorization URL
 	authURL, err := openaiAuth.GenerateAuthURL(state, pkceCodes)
@@ -1686,6 +1770,12 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		if isWebUI {
 			defer stopCallbackForwarderInstance(codexCallbackPort, forwarder)
 		}
+		transferComplete := false
+		defer func() {
+			if !transferComplete {
+				releaseCodexOAuthIPv6(h.cfg, reservationKey)
+			}
+		}()
 
 		// Wait for callback file
 		waitFile := filepath.Join(h.cfg.AuthDir, fmt.Sprintf(".oauth-codex-%s.oauth", state))
@@ -1725,7 +1815,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 
 		log.Debug("Authorization code received, exchanging for tokens...")
 		// Exchange code for tokens using internal auth service
-		bundle, errExchange := openaiAuth.ExchangeCodeForTokens(ctx, code, pkceCodes)
+		bundle, errExchange := exchangeCodexTokensWithRetry(ctx, openaiAuth, code, pkceCodes)
 		if errExchange != nil {
 			authErr := codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, errExchange)
 			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
@@ -1758,8 +1848,20 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				"account_id": tokenStorage.AccountID,
 			},
 		}
+		if exchangeIPv6 != "" {
+			record.Metadata["ipv6"] = exchangeIPv6
+			if _, errTransfer := transferCodexOAuthIPv6(h.cfg, reservationKey, record.ID); errTransfer != nil {
+				log.Warnf("codex ipv6: transfer failed from %s to %s: %v", reservationKey, record.ID, errTransfer)
+				releaseCodexOAuthIPv6(h.cfg, reservationKey)
+			} else {
+				transferComplete = true
+			}
+		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
+			if transferComplete {
+				releaseCodexOAuthIPv6(h.cfg, record.ID)
+			}
 			SetOAuthSessionError(state, "Failed to save authentication tokens")
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
 			return
@@ -1770,10 +1872,127 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		}
 		fmt.Println("You can now use Codex services through this CLI")
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("codex")
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
+}
+
+func exchangeCodexTokensWithRetry(ctx context.Context, authSvc *codex.CodexAuth, code string, pkceCodes *codex.PKCECodes) (*codex.CodexAuthBundle, error) {
+	if authSvc == nil {
+		return nil, fmt.Errorf("codex auth service unavailable")
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	backoffs := []time.Duration{0, 2 * time.Second, 4 * time.Second, 8 * time.Second}
+	var lastErr error
+	for attempt, delay := range backoffs {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-time.After(delay):
+			}
+		}
+		bundle, err := authSvc.ExchangeCodeForTokens(ctx, code, pkceCodes)
+		if err == nil {
+			return bundle, nil
+		}
+		lastErr = err
+		if !isRetryableCodexExchangeErr(err) {
+			break
+		}
+	}
+	return nil, lastErr
+}
+
+func codexOAuthReservationKey(state string) string {
+	state = strings.TrimSpace(state)
+	if state == "" {
+		return ""
+	}
+	return "codex-oauth:" + state
+}
+
+func reserveCodexOAuthIPv6(cfg *config.Config, owner string) string {
+	pool := GetIPv6Pool(cfg)
+	if pool == nil || strings.TrimSpace(owner) == "" {
+		return ""
+	}
+	ipv6, err := pool.Assign(owner)
+	if err != nil {
+		log.Warnf("codex ipv6: reserve failed for %s: %v", owner, err)
+		return ""
+	}
+	return ipv6
+}
+
+func transferCodexOAuthIPv6(cfg *config.Config, fromOwner, toOwner string) (string, error) {
+	pool := GetIPv6Pool(cfg)
+	if pool == nil {
+		return "", nil
+	}
+	return pool.Transfer(fromOwner, toOwner)
+}
+
+func releaseCodexOAuthIPv6(cfg *config.Config, owner string) {
+	pool := GetIPv6Pool(cfg)
+	if pool == nil {
+		return
+	}
+	pool.Unregister(owner)
+}
+
+func isRetryableCodexExchangeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "timeout") {
+		return true
+	}
+	if strings.Contains(msg, "connection reset") || strings.Contains(msg, "connection refused") {
+		return true
+	}
+	if code := codexExchangeStatusCode(msg); code >= 500 && code <= 599 {
+		return true
+	}
+	return false
+}
+
+func codexExchangeStatusCode(msg string) int {
+	idx := strings.Index(msg, "status ")
+	if idx == -1 {
+		return 0
+	}
+	rest := msg[idx+len("status "):]
+	digits := make([]byte, 0, 3)
+	for i := 0; i < len(rest); i++ {
+		ch := rest[i]
+		if ch >= '0' && ch <= '9' {
+			digits = append(digits, ch)
+			if len(digits) == 3 {
+				break
+			}
+		} else if len(digits) > 0 {
+			break
+		}
+	}
+	if len(digits) != 3 {
+		return 0
+	}
+	code, err := strconv.Atoi(string(digits))
+	if err != nil {
+		return 0
+	}
+	return code
 }
 
 func (h *Handler) RequestGitLabToken(c *gin.Context) {

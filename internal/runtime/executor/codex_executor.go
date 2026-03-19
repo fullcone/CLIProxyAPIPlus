@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
@@ -33,6 +34,26 @@ const (
 )
 
 var dataTag = []byte("data:")
+var codexAuthCache sync.Map
+
+func newCodexAuthService(cfg *config.Config, proxyURL, ipv6Addr string) *codexauth.CodexAuth {
+	proxyURL = strings.TrimSpace(proxyURL)
+	ipv6Addr = strings.TrimSpace(ipv6Addr)
+	cfgToUse := cfg
+	if proxyURL != "" {
+		if cfgToUse == nil {
+			cfgToUse = &config.Config{}
+		}
+		cfgCopy := *cfgToUse
+		cfgCopy.SDKConfig = cfgToUse.SDKConfig
+		cfgCopy.SDKConfig.ProxyURL = proxyURL
+		cfgToUse = &cfgCopy
+	}
+	if ipv6Addr != "" {
+		return codexauth.NewCodexAuth(cfgToUse, ipv6Addr)
+	}
+	return codexauth.NewCodexAuth(cfgToUse)
+}
 
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
@@ -571,7 +592,36 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	if refreshToken == "" {
 		return auth, nil
 	}
-	svc := codexauth.NewCodexAuth(e.cfg)
+	proxyURL := strings.TrimSpace(auth.ProxyURL)
+	if proxyURL == "" && e.cfg != nil {
+		proxyURL = strings.TrimSpace(e.cfg.ProxyURL)
+	}
+	ipv6Addr := ""
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["ipv6"].(string); ok {
+			ipv6Addr = strings.TrimSpace(v)
+		}
+	}
+	cacheKey := strings.TrimSpace(auth.ID)
+	if cacheKey == "" {
+		cacheKey = refreshToken
+	}
+	if proxyURL != "" {
+		cacheKey += "|proxy:" + proxyURL
+	}
+	if ipv6Addr != "" {
+		cacheKey += "|ipv6:" + ipv6Addr
+	}
+	var svc *codexauth.CodexAuth
+	if cached, ok := codexAuthCache.Load(cacheKey); ok {
+		if cachedSvc, ok := cached.(*codexauth.CodexAuth); ok && cachedSvc != nil {
+			svc = cachedSvc
+		}
+	}
+	if svc == nil {
+		svc = newCodexAuthService(e.cfg, proxyURL, ipv6Addr)
+		codexAuthCache.Store(cacheKey, svc)
+	}
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
 		return nil, err

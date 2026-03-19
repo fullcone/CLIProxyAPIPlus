@@ -65,6 +65,8 @@ const (
 	refreshFailureBackoff = 1 * time.Minute
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
+	kiroQuotaBackoffMax   = 1 * time.Minute
+	codexQuotaCooldown    = 24 * time.Hour
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -1649,7 +1651,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 					if result.RetryAfter != nil {
 						next = now.Add(*result.RetryAfter)
 					} else {
-						cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
+						cooldown, nextLevel := nextQuotaCooldown(auth.Provider, backoffLevel, quotaCooldownDisabledForAuth(auth))
 						if cooldown > 0 {
 							next = now.Add(cooldown)
 						}
@@ -1934,7 +1936,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		if retryAfter != nil {
 			next = now.Add(*retryAfter)
 		} else {
-			cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, quotaCooldownDisabledForAuth(auth))
+			cooldown, nextLevel := nextQuotaCooldown(auth.Provider, auth.Quota.BackoffLevel, quotaCooldownDisabledForAuth(auth))
 			if cooldown > 0 {
 				next = now.Add(cooldown)
 			}
@@ -1957,12 +1959,25 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 }
 
 // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
-func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) {
+func nextQuotaCooldown(provider string, prevLevel int, disableCooling bool) (time.Duration, int) {
 	if prevLevel < 0 {
 		prevLevel = 0
 	}
 	if disableCooling {
 		return 0, prevLevel
+	}
+	if strings.EqualFold(provider, "kiro") {
+		cooldown := quotaBackoffBase << uint(prevLevel)
+		if cooldown < quotaBackoffBase {
+			cooldown = quotaBackoffBase
+		}
+		if cooldown >= kiroQuotaBackoffMax {
+			return kiroQuotaBackoffMax, prevLevel + 1
+		}
+		return cooldown, prevLevel + 1
+	}
+	if strings.EqualFold(provider, "codex") {
+		return codexQuotaCooldown, prevLevel
 	}
 	cooldown := quotaBackoffBase * time.Duration(1<<prevLevel)
 	if cooldown < quotaBackoffBase {
@@ -2403,6 +2418,9 @@ func (m *Manager) shouldRefresh(a *Auth, now time.Time) bool {
 		return false
 	}
 	if !a.NextRefreshAfter.IsZero() && now.Before(a.NextRefreshAfter) {
+		return false
+	}
+	if strings.EqualFold(a.Provider, "codex") && a.Quota.Exceeded && !a.NextRetryAfter.IsZero() && a.NextRetryAfter.After(now) {
 		return false
 	}
 	if evaluator, ok := a.Runtime.(RefreshEvaluator); ok && evaluator != nil {

@@ -35,11 +35,23 @@ type CodexAuth struct {
 }
 
 // NewCodexAuth creates a new CodexAuth service instance.
-// It initializes an HTTP client with proxy settings from the provided configuration.
-func NewCodexAuth(cfg *config.Config) *CodexAuth {
-	return &CodexAuth{
-		httpClient: util.SetProxy(&cfg.SDKConfig, &http.Client{}),
+// It initializes an HTTP client with IPv6 binding (optional) and proxy settings.
+func NewCodexAuth(cfg *config.Config, ipv6 ...string) *CodexAuth {
+	if cfg == nil {
+		cfg = &config.Config{}
 	}
+	client := &http.Client{}
+	if len(ipv6) > 0 {
+		if addr := strings.TrimSpace(ipv6[0]); addr != "" {
+			if transport, err := util.NewIPv6Transport(addr); err == nil {
+				client.Transport = transport
+			} else {
+				log.Warnf("codex auth: ipv6 transport setup failed: %v", err)
+			}
+		}
+	}
+	client = util.SetProxy(&cfg.SDKConfig, client)
+	return &CodexAuth{httpClient: client}
 }
 
 // GenerateAuthURL creates the OAuth authorization URL with PKCE (Proof Key for Code Exchange).

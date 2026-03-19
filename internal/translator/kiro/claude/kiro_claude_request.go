@@ -709,6 +709,10 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 				ctx.ToolResults = filtered
 				if len(ctx.ToolResults) == 0 && len(ctx.Tools) == 0 {
 					h.UserInputMessage.UserInputMessageContext = nil
+					if strings.TrimSpace(h.UserInputMessage.Content) == strings.TrimSpace(kirocommon.DefaultUserContentWithToolResults) {
+						h.UserInputMessage.Content = kirocommon.DefaultUserContent
+						log.Debugf("kiro: tool_results cleared from history[%d], falling back content to default: %s", i, h.UserInputMessage.Content)
+					}
 				}
 			}
 		}
@@ -728,6 +732,12 @@ func processMessages(messages gjson.Result, modelID, origin string) ([]KiroHisto
 			log.Infof("kiro: dropped %d orphaned tool_result(s) from currentMessage (compaction artifact)", len(currentToolResults)-len(filtered))
 		}
 		currentToolResults = filtered
+	}
+	if len(currentToolResults) == 0 && currentUserMsg != nil {
+		if strings.TrimSpace(currentUserMsg.Content) == strings.TrimSpace(kirocommon.DefaultUserContentWithToolResults) {
+			currentUserMsg.Content = kirocommon.DefaultUserContent
+			log.Debugf("kiro: tool_results cleared from currentMessage, falling back content to default: %s", currentUserMsg.Content)
+		}
 	}
 
 	return history, currentUserMsg, currentToolResults

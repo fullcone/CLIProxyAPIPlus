@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -404,13 +405,125 @@ func TestResetPinnedResponsesAuthIfBlockedClearsCodexSession(t *testing.T) {
 		BaseAPIHandler: handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager),
 	}
 	pinnedAuthID := auth.ID
-	handler.resetPinnedResponsesAuthIfBlocked("session-429", &pinnedAuthID)
+	handler.resetPinnedResponsesAuthIfBlocked("session-429", "gpt-5-codex", &pinnedAuthID)
 
 	if pinnedAuthID != "" {
 		t.Fatalf("expected pinned auth to be cleared after codex quota cooldown")
 	}
 	closed := executor.ClosedSessionIDs()
 	if len(closed) != 1 || closed[0] != "session-429" {
+		t.Fatalf("expected execution session to be closed once, got %v", closed)
+	}
+}
+
+func TestResetPinnedResponsesAuthIfBlockedClearsDisabledAuth(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	executor := &websocketAuthCaptureExecutor{}
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{
+		ID:       "codex-auth-disabled",
+		Provider: "codex",
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	disabled := auth.Clone()
+	disabled.Disabled = true
+	disabled.Status = coreauth.StatusDisabled
+	if _, errUpdate := manager.Update(context.Background(), disabled); errUpdate != nil {
+		t.Fatalf("disable auth: %v", errUpdate)
+	}
+
+	handler := &OpenAIResponsesAPIHandler{
+		BaseAPIHandler: handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager),
+	}
+	pinnedAuthID := auth.ID
+	handler.resetPinnedResponsesAuthIfBlocked("session-disabled", "gpt-5-codex", &pinnedAuthID)
+
+	if pinnedAuthID != "" {
+		t.Fatalf("expected pinned auth to be cleared after auth disabled")
+	}
+	closed := executor.ClosedSessionIDs()
+	if len(closed) != 1 || closed[0] != "session-disabled" {
+		t.Fatalf("expected execution session to be closed once, got %v", closed)
+	}
+}
+
+func TestResetPinnedResponsesAuthIfBlockedClearsTerminalCodexError(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	executor := &websocketAuthCaptureExecutor{}
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{
+		ID:       "codex-auth-terminal",
+		Provider: "codex",
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	terminal := auth.Clone()
+	terminal.Status = coreauth.StatusError
+	terminal.StatusMessage = "token has been invalidated"
+	terminal.LastError = &coreauth.Error{Message: "token has been invalidated"}
+	if _, errUpdate := manager.Update(context.Background(), terminal); errUpdate != nil {
+		t.Fatalf("update auth terminal error: %v", errUpdate)
+	}
+
+	handler := &OpenAIResponsesAPIHandler{
+		BaseAPIHandler: handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager),
+	}
+	pinnedAuthID := auth.ID
+	handler.resetPinnedResponsesAuthIfBlocked("session-terminal", "gpt-5-codex", &pinnedAuthID)
+
+	if pinnedAuthID != "" {
+		t.Fatalf("expected pinned auth to be cleared after terminal codex error")
+	}
+	closed := executor.ClosedSessionIDs()
+	if len(closed) != 1 || closed[0] != "session-terminal" {
+		t.Fatalf("expected execution session to be closed once, got %v", closed)
+	}
+}
+
+func TestResetPinnedResponsesAuthIfBlockedClearsModelUnavailable(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	executor := &websocketAuthCaptureExecutor{}
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{
+		ID:       "codex-auth-model-blocked",
+		Provider: "codex",
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	blocked := auth.Clone()
+	blocked.ModelStates = map[string]*coreauth.ModelState{
+		"gpt-5-codex": {
+			Status:         coreauth.StatusError,
+			Unavailable:    true,
+			NextRetryAfter: time.Now().Add(10 * time.Minute),
+			LastError:      &coreauth.Error{HTTPStatus: http.StatusUnauthorized, Message: "unauthorized"},
+		},
+	}
+	if _, errUpdate := manager.Update(context.Background(), blocked); errUpdate != nil {
+		t.Fatalf("update auth model state: %v", errUpdate)
+	}
+
+	handler := &OpenAIResponsesAPIHandler{
+		BaseAPIHandler: handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager),
+	}
+	pinnedAuthID := auth.ID
+	handler.resetPinnedResponsesAuthIfBlocked("session-model-blocked", "gpt-5-codex", &pinnedAuthID)
+
+	if pinnedAuthID != "" {
+		t.Fatalf("expected pinned auth to be cleared after model unavailable")
+	}
+	closed := executor.ClosedSessionIDs()
+	if len(closed) != 1 || closed[0] != "session-model-blocked" {
 		t.Fatalf("expected execution session to be closed once, got %v", closed)
 	}
 }

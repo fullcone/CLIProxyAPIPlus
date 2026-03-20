@@ -193,7 +193,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
 
 		completedOutput, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, &wsBodyLog, passthroughSessionID)
-		h.resetPinnedResponsesAuthIfBlocked(passthroughSessionID, &pinnedAuthID)
+		h.resetPinnedResponsesAuthIfBlocked(passthroughSessionID, modelName, &pinnedAuthID)
 		if errForward != nil {
 			wsTerminateErr = errForward
 			appendWebsocketEvent(&wsBodyLog, "disconnect", []byte(errForward.Error()))
@@ -204,7 +204,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 	}
 }
 
-func (h *OpenAIResponsesAPIHandler) resetPinnedResponsesAuthIfBlocked(sessionID string, pinnedAuthID *string) {
+func (h *OpenAIResponsesAPIHandler) resetPinnedResponsesAuthIfBlocked(sessionID string, modelName string, pinnedAuthID *string) {
 	if h == nil || h.AuthManager == nil || pinnedAuthID == nil {
 		return
 	}
@@ -219,15 +219,85 @@ func (h *OpenAIResponsesAPIHandler) resetPinnedResponsesAuthIfBlocked(sessionID 
 		*pinnedAuthID = ""
 		return
 	}
-	now := time.Now()
-	blockedByQuota := auth.Quota.Exceeded && !auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(now)
-	blockedUnavailable := auth.Unavailable && !auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(now)
-	if !strings.EqualFold(auth.Provider, "codex") || (!blockedByQuota && !blockedUnavailable) {
+	reason := pinnedResponsesAuthBlockReason(auth, modelName, time.Now())
+	if reason == "" {
 		return
 	}
-	log.Infof("responses websocket: clearing pinned auth session=%s auth=%s reason=quota_cooldown", strings.TrimSpace(sessionID), authID)
+	log.Infof("responses websocket: clearing pinned auth session=%s auth=%s reason=%s", strings.TrimSpace(sessionID), authID, reason)
 	h.AuthManager.CloseExecutionSession(sessionID)
 	*pinnedAuthID = ""
+}
+
+func pinnedResponsesAuthBlockReason(auth *coreauth.Auth, modelName string, now time.Time) string {
+	if auth == nil {
+		return "auth_missing"
+	}
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		return "auth_disabled"
+	}
+
+	if state := pinnedResponsesModelState(auth, modelName); state != nil {
+		if state.Status == coreauth.StatusDisabled {
+			return "model_disabled"
+		}
+		if reason := codexTerminalAuthReason(auth.Provider, state.StatusMessage, errorMessage(state.LastError)); reason != "" {
+			return reason
+		}
+		if state.Unavailable && !state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now) {
+			if state.Quota.Exceeded {
+				return "model_quota_cooldown"
+			}
+			return "model_unavailable"
+		}
+	}
+
+	if reason := codexTerminalAuthReason(auth.Provider, auth.StatusMessage, errorMessage(auth.LastError)); reason != "" {
+		return reason
+	}
+	if auth.Quota.Exceeded && !auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(now) {
+		return "quota_cooldown"
+	}
+	if auth.Unavailable && !auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(now) {
+		return "auth_unavailable"
+	}
+	return ""
+}
+
+func pinnedResponsesModelState(auth *coreauth.Auth, modelName string) *coreauth.ModelState {
+	if auth == nil || modelName == "" || len(auth.ModelStates) == 0 {
+		return nil
+	}
+	if state, ok := auth.ModelStates[modelName]; ok && state != nil {
+		return state
+	}
+	baseModel := strings.TrimSpace(thinking.ParseSuffix(modelName).ModelName)
+	if baseModel == "" || baseModel == modelName {
+		return nil
+	}
+	return auth.ModelStates[baseModel]
+}
+
+func codexTerminalAuthReason(provider string, values ...string) string {
+	if !strings.EqualFold(strings.TrimSpace(provider), "codex") {
+		return ""
+	}
+	for _, value := range values {
+		lower := strings.ToLower(strings.TrimSpace(value))
+		switch {
+		case strings.Contains(lower, "token has been invalidated"):
+			return "token_invalidated"
+		case strings.Contains(lower, "account has been deactivated"):
+			return "account_deactivated"
+		}
+	}
+	return ""
+}
+
+func errorMessage(err *coreauth.Error) string {
+	if err == nil {
+		return ""
+	}
+	return strings.TrimSpace(err.Message)
 }
 
 func websocketUpgradeHeaders(req *http.Request) http.Header {

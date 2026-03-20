@@ -122,6 +122,41 @@ func TestFillFirstSelectorPick_PriorityFallbackCooldown(t *testing.T) {
 	}
 }
 
+func TestFillFirstSelectorPick_AuthLevelCooldownBlocksAllModels(t *testing.T) {
+	t.Parallel()
+
+	selector := &FillFirstSelector{}
+	now := time.Now()
+	model := "gpt-5.2-codex(low)"
+
+	high := &Auth{
+		ID:             "high",
+		Provider:       "codex",
+		Unavailable:    true,
+		NextRetryAfter: now.Add(30 * time.Minute),
+		Quota: QuotaState{
+			Exceeded:      true,
+			Reason:        "quota",
+			NextRecoverAt: now.Add(30 * time.Minute),
+		},
+		ModelStates: map[string]*ModelState{
+			model: {Status: StatusActive},
+		},
+	}
+	low := &Auth{ID: "low", Provider: "codex"}
+
+	got, err := selector.Pick(context.Background(), "codex", model, cliproxyexecutor.Options{}, []*Auth{high, low})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "low" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "low")
+	}
+}
+
 func TestRoundRobinSelectorPick_Concurrent(t *testing.T) {
 	selector := &RoundRobinSelector{}
 	auths := []*Auth{

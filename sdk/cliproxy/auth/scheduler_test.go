@@ -501,3 +501,31 @@ func TestManager_SchedulerTracksMarkResultCooldownAndRecovery(t *testing.T) {
 		t.Fatalf("len(seen) = %d, want %d", len(seen), 2)
 	}
 }
+
+func TestSchedulerPick_CodexAuthLevelCooldownBlocksOtherModels(t *testing.T) {
+	manager := NewManager(nil, &RoundRobinSelector{}, nil)
+	registerSchedulerModels(t, "codex", "gpt-5.4", "auth-a", "auth-b")
+	registerSchedulerModels(t, "codex", "gpt-5.2-codex(low)", "auth-a", "auth-b")
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-a", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(auth-a) error = %v", errRegister)
+	}
+	if _, errRegister := manager.Register(context.Background(), &Auth{ID: "auth-b", Provider: "codex"}); errRegister != nil {
+		t.Fatalf("Register(auth-b) error = %v", errRegister)
+	}
+
+	manager.MarkResult(context.Background(), Result{
+		AuthID:   "auth-a",
+		Provider: "codex",
+		Model:    "gpt-5.4",
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"},
+	})
+
+	got, errPick := manager.scheduler.pickSingle(context.Background(), "codex", "gpt-5.2-codex(low)", cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("scheduler.pickSingle() after auth-level cooldown error = %v", errPick)
+	}
+	if got == nil || got.ID != "auth-b" {
+		t.Fatalf("scheduler.pickSingle() after auth-level cooldown auth = %v, want auth-b", got)
+	}
+}

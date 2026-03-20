@@ -661,6 +661,7 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.DELETE("/oauth-model-alias", s.mgmt.DeleteOAuthModelAlias)
 
 		mgmt.GET("/auth-files", s.mgmt.ListAuthFiles)
+		mgmt.GET("/auth-files/diagnostics", s.mgmt.GetAuthDiagnostics)
 		mgmt.GET("/auth-files/models", s.mgmt.GetAuthFileModels)
 		mgmt.GET("/model-definitions/:channel", s.mgmt.GetStaticModelDefinitions)
 		mgmt.GET("/auth-files/download", s.mgmt.DownloadAuthFile)
@@ -686,7 +687,6 @@ func (s *Server) registerManagementRoutes() {
 		mgmt.POST("/oauth-callback", s.mgmt.PostOAuthCallback)
 		mgmt.GET("/get-auth-status", s.mgmt.GetAuthStatus)
 	}
-	s.mgmt.StartCodexCleanup(context.Background())
 }
 
 func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
@@ -697,6 +697,13 @@ func (s *Server) managementAvailabilityMiddleware() gin.HandlerFunc {
 		}
 		c.Next()
 	}
+}
+
+func (s *Server) StartCodexCleanup(ctx context.Context) {
+	if s == nil || s.mgmt == nil {
+		return
+	}
+	s.mgmt.StartCodexCleanup(ctx)
 }
 
 func (s *Server) serveManagementControlPanel(c *gin.Context) {

@@ -193,6 +193,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		dataChan, _, errChan := h.ExecuteStreamWithAuthManager(cliCtx, h.HandlerType(), modelName, requestJSON, "")
 
 		completedOutput, errForward := h.forwardResponsesWebsocket(c, conn, cliCancel, dataChan, errChan, &wsBodyLog, passthroughSessionID)
+		h.resetPinnedResponsesAuthIfBlocked(passthroughSessionID, &pinnedAuthID)
 		if errForward != nil {
 			wsTerminateErr = errForward
 			appendWebsocketEvent(&wsBodyLog, "disconnect", []byte(errForward.Error()))
@@ -201,6 +202,32 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 		}
 		lastResponseOutput = completedOutput
 	}
+}
+
+func (h *OpenAIResponsesAPIHandler) resetPinnedResponsesAuthIfBlocked(sessionID string, pinnedAuthID *string) {
+	if h == nil || h.AuthManager == nil || pinnedAuthID == nil {
+		return
+	}
+	authID := strings.TrimSpace(*pinnedAuthID)
+	if authID == "" {
+		return
+	}
+	auth, ok := h.AuthManager.GetByID(authID)
+	if !ok || auth == nil {
+		log.Infof("responses websocket: clearing pinned auth session=%s auth=%s reason=auth_missing", strings.TrimSpace(sessionID), authID)
+		h.AuthManager.CloseExecutionSession(sessionID)
+		*pinnedAuthID = ""
+		return
+	}
+	now := time.Now()
+	blockedByQuota := auth.Quota.Exceeded && !auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(now)
+	blockedUnavailable := auth.Unavailable && !auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(now)
+	if !strings.EqualFold(auth.Provider, "codex") || (!blockedByQuota && !blockedUnavailable) {
+		return
+	}
+	log.Infof("responses websocket: clearing pinned auth session=%s auth=%s reason=quota_cooldown", strings.TrimSpace(sessionID), authID)
+	h.AuthManager.CloseExecutionSession(sessionID)
+	*pinnedAuthID = ""
 }
 
 func websocketUpgradeHeaders(req *http.Request) http.Header {

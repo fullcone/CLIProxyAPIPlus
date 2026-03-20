@@ -22,6 +22,15 @@ import (
 	log "github.com/sirupsen/logrus"
 )
 
+type authFileSnapshot struct {
+	authFileCount     int
+	readableAuthCount int
+	synthesizedAuths  []*coreauth.Auth
+	lastAuthHashes    map[string]string
+	lastAuthContents  map[string]*coreauth.Auth
+	fileAuthsByPath   map[string]map[string]*coreauth.Auth
+}
+
 func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string, forceAuthRefresh bool) {
 	log.Debugf("starting full client load process")
 
@@ -61,56 +70,16 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 	log.Debugf("loaded %d API key clients", totalAPIKeyClients)
 
 	var authFileCount int
+	var scanned *authFileSnapshot
 	if rescanAuth {
-		authFileCount = w.loadFileClients(cfg)
-		log.Debugf("loaded %d file-based clients", authFileCount)
+		scanned = w.scanAuthFiles(cfg)
+		authFileCount = scanned.authFileCount
+		log.Debugf("loaded %d file-based auth files (%d readable, %d synthesized auths)", authFileCount, scanned.readableAuthCount, len(scanned.synthesizedAuths))
 	} else {
 		w.clientsMutex.RLock()
 		authFileCount = len(w.lastAuthHashes)
 		w.clientsMutex.RUnlock()
 		log.Debugf("skipping auth directory rescan; retaining %d existing auth files", authFileCount)
-	}
-
-	if rescanAuth {
-		w.clientsMutex.Lock()
-
-		w.lastAuthHashes = make(map[string]string)
-		w.lastAuthContents = make(map[string]*coreauth.Auth)
-		w.fileAuthsByPath = make(map[string]map[string]*coreauth.Auth)
-		if resolvedAuthDir, errResolveAuthDir := util.ResolveAuthDir(cfg.AuthDir); errResolveAuthDir != nil {
-			log.Errorf("failed to resolve auth directory for hash cache: %v", errResolveAuthDir)
-		} else if resolvedAuthDir != "" {
-			_ = filepath.Walk(resolvedAuthDir, func(path string, info fs.FileInfo, err error) error {
-				if err != nil {
-					return nil
-				}
-				if !info.IsDir() && strings.HasSuffix(strings.ToLower(info.Name()), ".json") {
-					if data, errReadFile := os.ReadFile(path); errReadFile == nil && len(data) > 0 {
-						sum := sha256.Sum256(data)
-						normalizedPath := w.normalizeAuthPath(path)
-						w.lastAuthHashes[normalizedPath] = hex.EncodeToString(sum[:])
-						// Parse and cache auth content for future diff comparisons
-						var auth coreauth.Auth
-						if errParse := json.Unmarshal(data, &auth); errParse == nil {
-							w.lastAuthContents[normalizedPath] = &auth
-						}
-						ctx := &synthesizer.SynthesisContext{
-							Config:      cfg,
-							AuthDir:     resolvedAuthDir,
-							Now:         time.Now(),
-							IDGenerator: synthesizer.NewStableIDGenerator(),
-						}
-						if generated := synthesizer.SynthesizeAuthFile(ctx, path, data); len(generated) > 0 {
-							if pathAuths := authSliceToMap(generated); len(pathAuths) > 0 {
-								w.fileAuthsByPath[normalizedPath] = pathAuths
-							}
-						}
-					}
-				}
-				return nil
-			})
-		}
-		w.clientsMutex.Unlock()
 	}
 
 	totalNewClients := authFileCount + geminiAPIKeyCount + vertexCompatAPIKeyCount + claudeAPIKeyCount + codexAPIKeyCount + openAICompatCount
@@ -120,7 +89,29 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 		w.reloadCallback(cfg)
 	}
 
-	w.refreshAuthState(forceAuthRefresh)
+	if rescanAuth {
+		configAuths := synthesizeConfigAuths(cfg)
+		auths := make([]*coreauth.Auth, 0, len(configAuths)+len(scanned.synthesizedAuths))
+		auths = append(auths, configAuths...)
+		auths = append(auths, scanned.synthesizedAuths...)
+
+		w.clientsMutex.Lock()
+		w.lastAuthHashes = scanned.lastAuthHashes
+		w.lastAuthContents = scanned.lastAuthContents
+		w.fileAuthsByPath = scanned.fileAuthsByPath
+		if len(w.runtimeAuths) > 0 {
+			for _, a := range w.runtimeAuths {
+				if a != nil {
+					auths = append(auths, a.Clone())
+				}
+			}
+		}
+		updates := w.prepareAuthUpdatesLocked(auths, forceAuthRefresh)
+		w.clientsMutex.Unlock()
+		w.dispatchAuthUpdates(updates)
+	} else {
+		w.refreshAuthState(forceAuthRefresh)
+	}
 
 	log.Infof("full client load complete - %d clients (%d auth files + %d Gemini API keys + %d Vertex API keys + %d Claude API keys + %d Codex keys + %d OpenAI-compat)",
 		totalNewClients,
@@ -131,6 +122,84 @@ func (w *Watcher) reloadClients(rescanAuth bool, affectedOAuthProviders []string
 		codexAPIKeyCount,
 		openAICompatCount,
 	)
+}
+
+func synthesizeConfigAuths(cfg *config.Config) []*coreauth.Auth {
+	ctx := &synthesizer.SynthesisContext{
+		Config:      cfg,
+		Now:         time.Now(),
+		IDGenerator: synthesizer.NewStableIDGenerator(),
+	}
+	configSynth := synthesizer.NewConfigSynthesizer()
+	auths, err := configSynth.Synthesize(ctx)
+	if err != nil {
+		return nil
+	}
+	return auths
+}
+
+func (w *Watcher) scanAuthFiles(cfg *config.Config) *authFileSnapshot {
+	snapshot := &authFileSnapshot{
+		lastAuthHashes:   make(map[string]string),
+		lastAuthContents: make(map[string]*coreauth.Auth),
+		fileAuthsByPath:  make(map[string]map[string]*coreauth.Auth),
+	}
+	authDir, errResolveAuthDir := util.ResolveAuthDir(cfg.AuthDir)
+	if errResolveAuthDir != nil {
+		log.Errorf("failed to resolve auth directory: %v", errResolveAuthDir)
+		return snapshot
+	}
+	if authDir == "" {
+		return snapshot
+	}
+
+	sctx := &synthesizer.SynthesisContext{
+		Config:      cfg,
+		AuthDir:     authDir,
+		Now:         time.Now(),
+		IDGenerator: synthesizer.NewStableIDGenerator(),
+	}
+
+	errWalk := filepath.Walk(authDir, func(path string, info fs.FileInfo, err error) error {
+		if err != nil {
+			return nil
+		}
+		if info.IsDir() || !strings.HasSuffix(strings.ToLower(info.Name()), ".json") {
+			return nil
+		}
+
+		snapshot.authFileCount++
+		data, errRead := os.ReadFile(path)
+		if errRead != nil || len(data) == 0 {
+			return nil
+		}
+		snapshot.readableAuthCount++
+
+		sum := sha256.Sum256(data)
+		normalizedPath := w.normalizeAuthPath(path)
+		snapshot.lastAuthHashes[normalizedPath] = hex.EncodeToString(sum[:])
+
+		var auth coreauth.Auth
+		if errParse := json.Unmarshal(data, &auth); errParse == nil {
+			parsed := auth
+			snapshot.lastAuthContents[normalizedPath] = &parsed
+		}
+
+		generated := synthesizer.SynthesizeAuthFile(sctx, path, data)
+		if len(generated) == 0 {
+			return nil
+		}
+		snapshot.synthesizedAuths = append(snapshot.synthesizedAuths, generated...)
+		if pathAuths := authSliceToMap(generated); len(pathAuths) > 0 {
+			snapshot.fileAuthsByPath[normalizedPath] = pathAuths
+		}
+		return nil
+	})
+	if errWalk != nil {
+		log.Errorf("error walking auth directory: %v", errWalk)
+	}
+	log.Debugf("auth directory scan complete - found %d .json files, %d readable", snapshot.authFileCount, snapshot.readableAuthCount)
+	return snapshot
 }
 
 func (w *Watcher) addOrUpdateClient(path string) {

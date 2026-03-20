@@ -175,20 +175,27 @@ func (w *Watcher) dispatchLoop(ctx context.Context) {
 		if !ok {
 			return
 		}
-		queue := w.getAuthQueue()
-		if queue == nil {
-			if ctx.Err() != nil {
+		w.dispatchInFlight.Add(int64(len(batch)))
+		func() {
+			defer w.dispatchInFlight.Add(-int64(len(batch)))
+			queue := w.getAuthQueue()
+			if queue == nil {
+				if ctx.Err() != nil {
+					return
+				}
+				time.Sleep(10 * time.Millisecond)
 				return
 			}
-			time.Sleep(10 * time.Millisecond)
-			continue
-		}
-		for _, update := range batch {
-			select {
-			case queue <- update:
-			case <-ctx.Done():
-				return
+			for _, update := range batch {
+				select {
+				case queue <- update:
+				case <-ctx.Done():
+					return
+				}
 			}
+		}()
+		if ctx.Err() != nil {
+			return
 		}
 	}
 }

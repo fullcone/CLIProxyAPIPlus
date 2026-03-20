@@ -230,3 +230,46 @@ func TestManager_MarkResult_RespectsAuthDisableCoolingOverride(t *testing.T) {
 		t.Fatalf("expected NextRetryAfter to be zero when disable_cooling=true, got %v", state.NextRetryAfter)
 	}
 }
+
+func TestManager_MarkResult_Codex429PromotesAuthCooldown(t *testing.T) {
+	prev := quotaCooldownDisabled.Load()
+	quotaCooldownDisabled.Store(false)
+	t.Cleanup(func() { quotaCooldownDisabled.Store(prev) })
+
+	m := NewManager(nil, nil, nil)
+	auth := &Auth{
+		ID:       "codex-auth-1",
+		Provider: "codex",
+	}
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	model := "gpt-5-codex"
+	before := time.Now()
+	m.MarkResult(context.Background(), Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    model,
+		Success:  false,
+		Error:    &Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"},
+	})
+
+	updated, ok := m.GetByID(auth.ID)
+	if !ok || updated == nil {
+		t.Fatalf("expected auth to be present")
+	}
+	if !updated.Quota.Exceeded {
+		t.Fatalf("expected auth quota exceeded to be set")
+	}
+	if updated.NextRetryAfter.IsZero() || !updated.NextRetryAfter.After(before) {
+		t.Fatalf("expected auth next retry after to be set in the future, got %v", updated.NextRetryAfter)
+	}
+	if !updated.Unavailable {
+		t.Fatalf("expected codex auth to be marked unavailable after 429")
+	}
+	state := updated.ModelStates[model]
+	if state == nil || !state.Quota.Exceeded {
+		t.Fatalf("expected model state quota exceeded to be retained")
+	}
+}

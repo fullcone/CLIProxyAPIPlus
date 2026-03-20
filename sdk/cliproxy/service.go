@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
@@ -75,6 +76,9 @@ type Service struct {
 
 	// authQueueStop cancels the auth update queue processing.
 	authQueueStop context.CancelFunc
+
+	// authUpdatesInFlight tracks auth updates currently being applied to coreManager.
+	authUpdatesInFlight atomic.Int64
 
 	// authManager handles legacy authentication operations.
 	authManager *sdkAuth.Manager
@@ -187,6 +191,8 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 	if s == nil {
 		return
 	}
+	s.authUpdatesInFlight.Add(1)
+	defer s.authUpdatesInFlight.Add(-1)
 	s.cfgMu.RLock()
 	cfg := s.cfg
 	s.cfgMu.RUnlock()
@@ -358,6 +364,154 @@ func (s *Service) applyRetryConfig(cfg *config.Config) {
 	s.coreManager.SetRetryConfig(cfg.RequestRetry, maxInterval, cfg.MaxRetryCredentials)
 }
 
+func authSnapshotSignature(auths []*coreauth.Auth) map[string]string {
+	signature := make(map[string]string, len(auths))
+	for _, auth := range auths {
+		if auth == nil || auth.ID == "" {
+			continue
+		}
+		signature[auth.ID] = fmt.Sprintf(
+			"%s|%t|%s|%d|%d",
+			strings.ToLower(strings.TrimSpace(auth.Provider)),
+			auth.Disabled,
+			strings.TrimSpace(auth.FileName),
+			auth.UpdatedAt.UnixNano(),
+			auth.LastRefreshedAt.UnixNano(),
+		)
+	}
+	return signature
+}
+
+func sameAuthSnapshot(authsA, authsB []*coreauth.Auth) bool {
+	if len(authsA) != len(authsB) {
+		return false
+	}
+	sigA := authSnapshotSignature(authsA)
+	sigB := authSnapshotSignature(authsB)
+	if len(sigA) != len(sigB) {
+		return false
+	}
+	for id, sig := range sigA {
+		if sigB[id] != sig {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *Service) snapshotLoadedWatcherAuths() []*coreauth.Auth {
+	if s == nil || s.watcher == nil {
+		return nil
+	}
+	if s.watcher.snapshotLoadedAuths != nil {
+		return s.watcher.snapshotLoadedAuths()
+	}
+	if s.watcher.snapshotAuths != nil {
+		return s.watcher.snapshotAuths()
+	}
+	return nil
+}
+
+func (s *Service) bootstrapCoreAuthSnapshot(ctx context.Context, auths []*coreauth.Auth) {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	ctx = coreauth.WithSkipPersist(ctx)
+
+	existing := s.coreManager.List()
+	nextIDs := make(map[string]struct{}, len(auths))
+	for _, auth := range auths {
+		if auth == nil || auth.ID == "" {
+			continue
+		}
+		nextIDs[auth.ID] = struct{}{}
+	}
+	for _, auth := range existing {
+		if auth == nil || auth.ID == "" {
+			continue
+		}
+		if _, ok := nextIDs[auth.ID]; ok {
+			continue
+		}
+		GlobalModelRegistry().UnregisterClient(auth.ID)
+	}
+
+	s.coreManager.LoadSnapshot(auths)
+	for _, auth := range auths {
+		if auth == nil || auth.ID == "" {
+			continue
+		}
+		s.ensureExecutorsForAuth(auth)
+		s.registerModelsForAuth(auth)
+	}
+	s.coreManager.RebuildScheduler()
+	log.Infof("bootstrapped core auth snapshot into manager: loaded=%d", len(nextIDs))
+}
+
+func (s *Service) bootstrapCoreAuthsFromWatcher(ctx context.Context) {
+	if s == nil || s.coreManager == nil {
+		return
+	}
+	initial := s.snapshotLoadedWatcherAuths()
+	s.bootstrapCoreAuthSnapshot(ctx, initial)
+
+	latest := s.snapshotLoadedWatcherAuths()
+	if sameAuthSnapshot(initial, latest) {
+		return
+	}
+
+	log.Infof("reconciling core auth bootstrap after watcher snapshot changed during startup (before=%d after=%d)", len(initial), len(latest))
+	s.bootstrapCoreAuthSnapshot(ctx, latest)
+}
+
+func (s *Service) waitForAuthLoadStability(ctx context.Context, stableFor, timeout time.Duration) {
+	if s == nil {
+		return
+	}
+	if stableFor <= 0 {
+		stableFor = 750 * time.Millisecond
+	}
+	if timeout <= 0 {
+		timeout = 2 * time.Minute
+	}
+
+	deadline := time.Now().Add(timeout)
+	stableSince := time.Time{}
+	for {
+		if ctx != nil && ctx.Err() != nil {
+			return
+		}
+		watcherPending := 0
+		if s.watcher != nil {
+			watcherPending = s.watcher.PendingAuthUpdateCount()
+		}
+		pending := 0
+		if s.authUpdates != nil {
+			pending = len(s.authUpdates)
+		}
+		inFlight := s.authUpdatesInFlight.Load()
+		if watcherPending == 0 && pending == 0 && inFlight == 0 {
+			if stableSince.IsZero() {
+				stableSince = time.Now()
+			}
+			if time.Since(stableSince) >= stableFor {
+				log.Infof("initial auth load stabilized (watcher_pending=%d pending=%d in_flight=%d)", watcherPending, pending, inFlight)
+				return
+			}
+		} else {
+			stableSince = time.Time{}
+		}
+		if time.Now().After(deadline) {
+			log.Warnf("timed out waiting for initial auth load stability (watcher_pending=%d pending=%d in_flight=%d); continuing startup", watcherPending, pending, inFlight)
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+}
+
 func openAICompatInfoFromAuth(a *coreauth.Auth) (providerKey string, compatName string, ok bool) {
 	if a == nil {
 		return "", "", false
@@ -516,12 +670,6 @@ func (s *Service) Run(ctx context.Context) error {
 
 	s.applyRetryConfig(s.cfg)
 
-	if s.coreManager != nil {
-		if errLoad := s.coreManager.Load(ctx); errLoad != nil {
-			log.Warnf("failed to load auth store: %v", errLoad)
-		}
-	}
-
 	tokenResult, err := s.tokenProvider.Load(ctx, s.cfg)
 	if err != nil && !errors.Is(err, context.Canceled) {
 		return err
@@ -610,24 +758,6 @@ func (s *Service) Run(ctx context.Context) error {
 		}
 	})
 
-	s.serverErr = make(chan error, 1)
-	go func() {
-		if errStart := s.server.Start(); errStart != nil {
-			s.serverErr <- errStart
-		} else {
-			s.serverErr <- nil
-		}
-	}()
-
-	time.Sleep(100 * time.Millisecond)
-	fmt.Printf("API server started successfully on: %s:%d\n", s.cfg.Host, s.cfg.Port)
-
-	s.applyPprofConfig(s.cfg)
-
-	if s.hooks.OnAfterStart != nil {
-		s.hooks.OnAfterStart(s)
-	}
-
 	var watcherWrapper *WatcherWrapper
 	reloadCallback := func(newCfg *config.Config) {
 		previousStrategy := ""
@@ -689,9 +819,6 @@ func (s *Service) Run(ctx context.Context) error {
 	}
 	s.watcher = watcherWrapper
 	s.ensureAuthUpdateQueue(ctx)
-	if s.authUpdates != nil {
-		watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
-	}
 	watcherWrapper.SetConfig(s.cfg)
 
 	// 方案 A: 连接 Kiro 后台刷新器回调到 Watcher
@@ -712,6 +839,32 @@ func (s *Service) Run(ctx context.Context) error {
 		return fmt.Errorf("cliproxy: failed to start watcher: %w", err)
 	}
 	log.Info("file watcher started for config and auth directory changes")
+	s.bootstrapCoreAuthsFromWatcher(ctx)
+	if s.authUpdates != nil {
+		watcherWrapper.SetAuthUpdateQueue(s.authUpdates)
+	}
+	s.waitForAuthLoadStability(ctx, 250*time.Millisecond, 15*time.Second)
+	if s.server != nil {
+		s.server.StartCodexCleanup(context.Background())
+	}
+
+	s.serverErr = make(chan error, 1)
+	go func() {
+		if errStart := s.server.Start(); errStart != nil {
+			s.serverErr <- errStart
+		} else {
+			s.serverErr <- nil
+		}
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	fmt.Printf("API server started successfully on: %s:%d\n", s.cfg.Host, s.cfg.Port)
+
+	s.applyPprofConfig(s.cfg)
+
+	if s.hooks.OnAfterStart != nil {
+		s.hooks.OnAfterStart(s)
+	}
 
 	// Prefer core auth manager auto refresh if available.
 	if s.coreManager != nil {

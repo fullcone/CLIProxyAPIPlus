@@ -87,8 +87,10 @@ type WatcherWrapper struct {
 
 	setConfig             func(cfg *config.Config)
 	snapshotAuths         func() []*coreauth.Auth
+	snapshotLoadedAuths   func() []*coreauth.Auth
 	setUpdateQueue        func(queue chan<- watcher.AuthUpdate)
 	dispatchRuntimeUpdate func(update watcher.AuthUpdate) bool
+	pendingAuthUpdates    func() int
 	notifyTokenRefreshed  func(tokenID, accessToken, refreshToken, expiresAt string) // 方案 A: 后台刷新通知
 }
 
@@ -146,6 +148,15 @@ func (w *WatcherWrapper) SetAuthUpdateQueue(queue chan<- watcher.AuthUpdate) {
 		return
 	}
 	w.setUpdateQueue(queue)
+}
+
+// PendingAuthUpdateCount returns the number of auth updates still buffered in
+// the watcher pipeline before they have been fully applied to the core manager.
+func (w *WatcherWrapper) PendingAuthUpdateCount() int {
+	if w == nil || w.pendingAuthUpdates == nil {
+		return 0
+	}
+	return w.pendingAuthUpdates()
 }
 
 // NotifyTokenRefreshed 通知 Watcher 后台刷新器已更新 token

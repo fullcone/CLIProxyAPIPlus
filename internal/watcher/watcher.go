@@ -55,6 +55,7 @@ type Watcher struct {
 	dispatchCond      *sync.Cond
 	pendingUpdates    map[string]AuthUpdate
 	pendingOrder      []string
+	dispatchInFlight  atomic.Int64
 	dispatchCancel    context.CancelFunc
 	storePersister    storePersister
 	mirroredAuthDir   string
@@ -143,6 +144,19 @@ func (w *Watcher) SetAuthUpdateQueue(queue chan<- AuthUpdate) {
 	w.setAuthUpdateQueue(queue)
 }
 
+// PendingAuthUpdateCount returns the number of auth updates still buffered inside
+// the watcher dispatch pipeline. This includes queued updates that have not been
+// handed to the service yet, plus the current dispatch batch being flushed.
+func (w *Watcher) PendingAuthUpdateCount() int {
+	if w == nil {
+		return 0
+	}
+	w.dispatchMu.Lock()
+	pending := len(w.pendingOrder)
+	w.dispatchMu.Unlock()
+	return pending + int(w.dispatchInFlight.Load())
+}
+
 // DispatchRuntimeAuthUpdate allows external runtime providers (e.g., websocket-driven auths)
 // to push auth updates through the same queue used by file/config watchers.
 // Returns true if the update was enqueued; false if no queue is configured.
@@ -156,6 +170,24 @@ func (w *Watcher) SnapshotCoreAuths() []*coreauth.Auth {
 	cfg := w.config
 	w.clientsMutex.RUnlock()
 	return snapshotCoreAuths(cfg, w.authDir)
+}
+
+// SnapshotLoadedCoreAuths returns the auth entries currently loaded in memory.
+// Unlike SnapshotCoreAuths, this does not rescan the auth directory.
+func (w *Watcher) SnapshotLoadedCoreAuths() []*coreauth.Auth {
+	if w == nil {
+		return nil
+	}
+	w.clientsMutex.RLock()
+	defer w.clientsMutex.RUnlock()
+	out := make([]*coreauth.Auth, 0, len(w.currentAuths))
+	for _, auth := range w.currentAuths {
+		if auth == nil {
+			continue
+		}
+		out = append(out, auth.Clone())
+	}
+	return out
 }
 
 // NotifyTokenRefreshed 处理后台刷新器的 token 更新通知

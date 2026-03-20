@@ -830,6 +830,58 @@ func TestDispatchAuthUpdatesFlushesQueue(t *testing.T) {
 	}
 }
 
+func TestPendingAuthUpdateCountIncludesQueuedAndInFlight(t *testing.T) {
+	w := &Watcher{
+		pendingUpdates: map[string]AuthUpdate{
+			"a": {Action: AuthUpdateActionAdd, ID: "a"},
+			"b": {Action: AuthUpdateActionModify, ID: "b"},
+		},
+		pendingOrder: []string{"a", "b"},
+	}
+	w.dispatchInFlight.Store(3)
+
+	if got := w.PendingAuthUpdateCount(); got != 5 {
+		t.Fatalf("expected pending count 5, got %d", got)
+	}
+}
+
+func TestPendingAuthUpdateCountTracksInFlightDispatchBatch(t *testing.T) {
+	queue := make(chan AuthUpdate) // unbuffered to keep dispatch blocked mid-batch
+	w := &Watcher{
+		authQueue: queue,
+		pendingUpdates: map[string]AuthUpdate{
+			"k": {Action: AuthUpdateActionAdd, ID: "k"},
+		},
+		pendingOrder: []string{"k"},
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		w.dispatchLoop(ctx)
+		close(done)
+	}()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if got := w.PendingAuthUpdateCount(); got == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			<-done
+			t.Fatal("expected in-flight dispatch batch to remain visible in pending count")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("expected dispatchLoop to exit after context cancel")
+	}
+}
+
 func TestDispatchLoopExitsOnContextDoneWhileSending(t *testing.T) {
 	queue := make(chan AuthUpdate) // unbuffered to block sends
 	w := &Watcher{

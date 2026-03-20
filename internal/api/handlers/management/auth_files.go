@@ -35,11 +35,12 @@ import (
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kimi"
 	kiroauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/kiro"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/auth/qwen"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/interfaces"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/misc"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/registry"
-	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/watcher/synthesizer"
 	sdkAuth "github.com/router-for-me/CLIProxyAPI/v6/sdk/auth"
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	log "github.com/sirupsen/logrus"
@@ -863,50 +864,46 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 	if err := json.Unmarshal(data, &metadata); err != nil {
 		return fmt.Errorf("invalid auth file: %w", err)
 	}
-	provider, _ := metadata["type"].(string)
-	if provider == "" {
-		provider = "unknown"
-	}
-	label := provider
-	if email, ok := metadata["email"].(string); ok && email != "" {
-		label = email
-	}
 	lastRefresh, hasLastRefresh := extractLastRefreshTimestamp(metadata)
 
-	authID := h.authIDForPath(path)
-	if authID == "" {
-		authID = path
+	sctx := &synthesizer.SynthesisContext{
+		Config:      h.cfg,
+		AuthDir:     strings.TrimSpace(h.cfg.AuthDir),
+		Now:         time.Now(),
+		IDGenerator: synthesizer.NewStableIDGenerator(),
 	}
-	attr := map[string]string{
-		"path":   path,
-		"source": path,
+	auths := synthesizer.SynthesizeAuthFile(sctx, path, data)
+	if len(auths) == 0 {
+		return fmt.Errorf("auth file did not synthesize any auth entries")
 	}
-	auth := &coreauth.Auth{
-		ID:         authID,
-		Provider:   provider,
-		FileName:   filepath.Base(path),
-		Label:      label,
-		Status:     coreauth.StatusActive,
-		Attributes: attr,
-		Metadata:   metadata,
-		CreatedAt:  time.Now(),
-		UpdatedAt:  time.Now(),
-	}
-	if hasLastRefresh {
-		auth.LastRefreshedAt = lastRefresh
-	}
-	if existing, ok := h.authManager.GetByID(authID); ok {
-		auth.CreatedAt = existing.CreatedAt
-		if !hasLastRefresh {
-			auth.LastRefreshedAt = existing.LastRefreshedAt
+
+	for _, auth := range auths {
+		if auth == nil || strings.TrimSpace(auth.ID) == "" {
+			continue
 		}
-		auth.NextRefreshAfter = existing.NextRefreshAfter
-		auth.Runtime = existing.Runtime
-		_, err := h.authManager.Update(ctx, auth)
-		return err
+		if strings.TrimSpace(auth.FileName) == "" {
+			auth.FileName = filepath.Base(path)
+		}
+		if hasLastRefresh && auth.Attributes["runtime_only"] != "true" {
+			auth.LastRefreshedAt = lastRefresh
+		}
+		if existing, ok := h.authManager.GetByID(auth.ID); ok {
+			auth.CreatedAt = existing.CreatedAt
+			if !hasLastRefresh {
+				auth.LastRefreshedAt = existing.LastRefreshedAt
+			}
+			auth.NextRefreshAfter = existing.NextRefreshAfter
+			auth.Runtime = existing.Runtime
+			if _, err := h.authManager.Update(ctx, auth); err != nil {
+				return err
+			}
+			continue
+		}
+		if _, err := h.authManager.Register(ctx, auth); err != nil {
+			return err
+		}
 	}
-	_, err := h.authManager.Register(ctx, auth)
-	return err
+	return nil
 }
 
 // PatchAuthFileStatus toggles the disabled state of an auth file
@@ -1145,7 +1142,18 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
-	return store.Save(ctx, record)
+	savedPath, err := store.Save(ctx, record)
+	if err != nil {
+		return "", err
+	}
+	if h.authManager != nil && strings.TrimSpace(savedPath) != "" {
+		if info, statErr := os.Stat(savedPath); statErr == nil && !info.IsDir() {
+			if errReg := h.registerAuthFromFile(ctx, savedPath, nil); errReg != nil {
+				log.Warnf("saved auth file %s but failed to register immediately: %v", savedPath, errReg)
+			}
+		}
+	}
+	return savedPath, nil
 }
 
 func gitLabBaseURLFromRequest(c *gin.Context) string {

@@ -851,6 +851,38 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	return auth.Clone(), nil
 }
 
+// LoadSnapshot replaces the current in-memory auth set from a supplied snapshot.
+// It skips persistence and defers scheduler reconciliation to the caller.
+func (m *Manager) LoadSnapshot(auths []*Auth) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	m.auths = make(map[string]*Auth, len(auths))
+	for _, auth := range auths {
+		if auth == nil || auth.ID == "" {
+			continue
+		}
+		authCopy := auth.Clone()
+		authCopy.EnsureIndex()
+		m.auths[authCopy.ID] = authCopy
+	}
+	cfg, _ := m.runtimeConfig.Load().(*internalconfig.Config)
+	if cfg == nil {
+		cfg = &internalconfig.Config{}
+	}
+	m.rebuildAPIKeyModelAliasLocked(cfg)
+	m.mu.Unlock()
+}
+
+// RebuildScheduler refreshes scheduler state from the current in-memory auth set.
+func (m *Manager) RebuildScheduler() {
+	if m == nil {
+		return
+	}
+	m.syncScheduler()
+}
+
 // Load resets manager state from the backing store.
 func (m *Manager) Load(ctx context.Context) error {
 	m.mu.Lock()
@@ -1681,6 +1713,9 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 				auth.Status = StatusError
 				auth.UpdatedAt = now
 				updateAggregatedAvailability(auth, now)
+				if statusCode == 429 && strings.EqualFold(auth.Provider, "codex") {
+					applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
+				}
 			} else {
 				applyAuthFailureState(auth, result.Error, result.RetryAfter, now)
 			}

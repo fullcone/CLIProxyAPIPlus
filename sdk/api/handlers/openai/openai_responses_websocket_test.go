@@ -60,6 +60,7 @@ func (s *orderedWebsocketSelector) Pick(_ context.Context, _ string, _ string, _
 type websocketAuthCaptureExecutor struct {
 	mu      sync.Mutex
 	authIDs []string
+	closed  []string
 }
 
 func (e *websocketAuthCaptureExecutor) Identifier() string { return "test-provider" }
@@ -93,10 +94,22 @@ func (e *websocketAuthCaptureExecutor) HttpRequest(context.Context, *coreauth.Au
 	return nil, errors.New("not implemented")
 }
 
+func (e *websocketAuthCaptureExecutor) CloseExecutionSession(sessionID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.closed = append(e.closed, sessionID)
+}
+
 func (e *websocketAuthCaptureExecutor) AuthIDs() []string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return append([]string(nil), e.authIDs...)
+}
+
+func (e *websocketAuthCaptureExecutor) ClosedSessionIDs() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.closed...)
 }
 
 func (e *websocketCaptureExecutor) Identifier() string { return "test-provider" }
@@ -363,6 +376,42 @@ func TestAppendWebsocketEventNoGrowthAfterLimit(t *testing.T) {
 
 	if builder.String() != initial {
 		t.Fatalf("builder grew after reaching limit")
+	}
+}
+
+func TestResetPinnedResponsesAuthIfBlockedClearsCodexSession(t *testing.T) {
+	manager := coreauth.NewManager(nil, nil, nil)
+	executor := &websocketAuthCaptureExecutor{}
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{
+		ID:       "codex-auth-1",
+		Provider: "codex",
+	}
+	if _, errRegister := manager.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	manager.MarkResult(context.Background(), coreauth.Result{
+		AuthID:   auth.ID,
+		Provider: "codex",
+		Model:    "gpt-5-codex",
+		Success:  false,
+		Error:    &coreauth.Error{HTTPStatus: http.StatusTooManyRequests, Message: "quota"},
+	})
+
+	handler := &OpenAIResponsesAPIHandler{
+		BaseAPIHandler: handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager),
+	}
+	pinnedAuthID := auth.ID
+	handler.resetPinnedResponsesAuthIfBlocked("session-429", &pinnedAuthID)
+
+	if pinnedAuthID != "" {
+		t.Fatalf("expected pinned auth to be cleared after codex quota cooldown")
+	}
+	closed := executor.ClosedSessionIDs()
+	if len(closed) != 1 || closed[0] != "session-429" {
+		t.Fatalf("expected execution session to be closed once, got %v", closed)
 	}
 }
 

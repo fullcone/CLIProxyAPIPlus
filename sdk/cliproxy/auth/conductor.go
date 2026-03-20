@@ -101,6 +101,32 @@ type Result struct {
 	Error *Error
 }
 
+type authExecutionLease struct {
+	manager  *Manager
+	authID   string
+	released atomic.Bool
+}
+
+func (l *authExecutionLease) Release() {
+	if l == nil || l.manager == nil || strings.TrimSpace(l.authID) == "" {
+		return
+	}
+	if l.released.Swap(true) {
+		return
+	}
+	l.manager.mu.Lock()
+	defer l.manager.mu.Unlock()
+	if l.manager.authInFlight == nil {
+		return
+	}
+	count := l.manager.authInFlight[l.authID]
+	if count <= 1 {
+		delete(l.manager.authInFlight, l.authID)
+		return
+	}
+	l.manager.authInFlight[l.authID] = count - 1
+}
+
 // Selector chooses an auth candidate for execution.
 type Selector interface {
 	Pick(ctx context.Context, provider, model string, opts cliproxyexecutor.Options, auths []*Auth) (*Auth, error)
@@ -130,13 +156,14 @@ func (NoopHook) OnResult(context.Context, Result) {}
 
 // Manager orchestrates auth lifecycle, selection, execution, and persistence.
 type Manager struct {
-	store     Store
-	executors map[string]ProviderExecutor
-	selector  Selector
-	hook      Hook
-	mu        sync.RWMutex
-	auths     map[string]*Auth
-	scheduler *authScheduler
+	store        Store
+	executors    map[string]ProviderExecutor
+	selector     Selector
+	hook         Hook
+	mu           sync.RWMutex
+	auths        map[string]*Auth
+	authInFlight map[string]int
+	scheduler    *authScheduler
 	// providerOffsets tracks per-model provider rotation state for multi-provider routing.
 	providerOffsets map[string]int
 
@@ -181,6 +208,7 @@ func NewManager(store Store, selector Selector, hook Hook) *Manager {
 		selector:         selector,
 		hook:             hook,
 		auths:            make(map[string]*Auth),
+		authInFlight:     make(map[string]int),
 		providerOffsets:  make(map[string]int),
 		modelPoolOffsets: make(map[string]int),
 		refreshSemaphore: make(chan struct{}, refreshMaxConcurrency),
@@ -233,6 +261,62 @@ func (m *Manager) RefreshSchedulerEntry(authID string) {
 	snapshot := auth.Clone()
 	m.mu.RUnlock()
 	m.scheduler.upsertAuth(snapshot)
+}
+
+func authExecutionConcurrencyLimit(auth *Auth) int {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return 0
+	}
+	return 1
+}
+
+func (m *Manager) authExecutionInFlightCount(authID string) int {
+	authID = strings.TrimSpace(authID)
+	if m == nil || authID == "" {
+		return 0
+	}
+	m.mu.RLock()
+	defer m.mu.RUnlock()
+	return m.authInFlight[authID]
+}
+
+func (m *Manager) isAuthExecutionSaturatedLocked(auth *Auth) bool {
+	if m == nil || auth == nil {
+		return false
+	}
+	limit := authExecutionConcurrencyLimit(auth)
+	if limit <= 0 {
+		return false
+	}
+	return m.authInFlight[strings.TrimSpace(auth.ID)] >= limit
+}
+
+func (m *Manager) tryReserveAuthExecution(auth *Auth) (*authExecutionLease, int, int, bool) {
+	authID := ""
+	if auth != nil {
+		authID = strings.TrimSpace(auth.ID)
+	}
+	limit := authExecutionConcurrencyLimit(auth)
+	if authID == "" {
+		return nil, 0, limit, false
+	}
+	if limit <= 0 {
+		return &authExecutionLease{}, 0, 0, true
+	}
+
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	current := m.auths[authID]
+	if current == nil || current.Disabled {
+		return nil, m.authInFlight[authID], limit, false
+	}
+	inFlight := m.authInFlight[authID]
+	if inFlight >= limit {
+		return nil, inFlight, limit, false
+	}
+	inFlight++
+	m.authInFlight[authID] = inFlight
+	return &authExecutionLease{manager: m, authID: authID}, inFlight, limit, true
 }
 
 func (m *Manager) SetSelector(selector Selector) {
@@ -451,6 +535,30 @@ func discardStreamChunks(ch <-chan cliproxyexecutor.StreamChunk) {
 		for range ch {
 		}
 	}()
+}
+
+func wrapStreamResultWithFinalizer(result *cliproxyexecutor.StreamResult, finalizer func()) *cliproxyexecutor.StreamResult {
+	if result == nil {
+		if finalizer != nil {
+			finalizer()
+		}
+		return nil
+	}
+	if finalizer == nil {
+		return result
+	}
+	out := make(chan cliproxyexecutor.StreamChunk)
+	go func() {
+		defer close(out)
+		defer finalizer()
+		if result.Chunks == nil {
+			return
+		}
+		for chunk := range result.Chunks {
+			out <- chunk
+		}
+	}()
+	return &cliproxyexecutor.StreamResult{Headers: result.Headers, Chunks: out}
 }
 
 func readStreamBootstrap(ctx context.Context, ch <-chan cliproxyexecutor.StreamChunk) ([]cliproxyexecutor.StreamChunk, bool, error) {
@@ -1012,16 +1120,17 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
-	tried := make(map[string]struct{})
+	excluded := make(map[string]struct{})
+	attempted := make(map[string]struct{})
 	var lastErr error
 	for {
-		if maxRetryCredentials > 0 && len(tried) >= maxRetryCredentials {
+		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
+		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, excluded)
 		if errPick != nil {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
@@ -1030,10 +1139,17 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 
 		entry := logEntryWithRequestID(ctx)
+		lease, inFlight, limit, reserved := m.tryReserveAuthExecution(auth)
+		if !reserved {
+			excluded[auth.ID] = struct{}{}
+			debugLogAuthInFlightSkip(entry, auth, req.Model, inFlight, limit)
+			continue
+		}
+		excluded[auth.ID] = struct{}{}
+		attempted[auth.ID] = struct{}{}
 		debugLogAuthSelection(entry, auth, provider, req.Model)
+		debugLogAuthInFlightReserved(entry, auth, req.Model, inFlight, limit)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
-
-		tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -1041,38 +1157,55 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		}
 
 		models := m.prepareExecutionModels(auth, routeModel)
-		var authErr error
-		for _, upstreamModel := range models {
-			execReq := req
-			execReq.Model = upstreamModel
-			resp, errExec := executor.Execute(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
-			if errExec != nil {
-				if errCtx := execCtx.Err(); errCtx != nil {
-					return cliproxyexecutor.Response{}, errCtx
-				}
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
-				}
-				if ra := retryAfterFromError(errExec); ra != nil {
-					result.RetryAfter = ra
+		var (
+			authErr error
+			resp    cliproxyexecutor.Response
+			respOK  bool
+		)
+		func() {
+			defer lease.Release()
+			for _, upstreamModel := range models {
+				execReq := req
+				execReq.Model = upstreamModel
+				currentResp, errExec := executor.Execute(execCtx, auth, execReq, opts)
+				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
+				if errExec != nil {
+					if errCtx := execCtx.Err(); errCtx != nil {
+						authErr = errCtx
+						return
+					}
+					result.Error = &Error{Message: errExec.Error()}
+					if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
+						result.Error.HTTPStatus = se.StatusCode()
+					}
+					if ra := retryAfterFromError(errExec); ra != nil {
+						result.RetryAfter = ra
+					}
+					m.MarkResult(execCtx, result)
+					authErr = errExec
+					if isRequestInvalidError(errExec) {
+						return
+					}
+					continue
 				}
 				m.MarkResult(execCtx, result)
-				if isRequestInvalidError(errExec) {
-					return cliproxyexecutor.Response{}, errExec
-				}
-				authErr = errExec
-				continue
+				resp = currentResp
+				respOK = true
+				authErr = nil
+				return
 			}
-			m.MarkResult(execCtx, result)
+		}()
+		if respOK {
 			return resp, nil
 		}
-		if authErr != nil {
-			if isRequestInvalidError(authErr) {
-				return cliproxyexecutor.Response{}, authErr
+		lastErr = authErr
+		if lastErr != nil {
+			if errCtx := ctx.Err(); errCtx != nil {
+				return cliproxyexecutor.Response{}, errCtx
 			}
-			lastErr = authErr
+			if isRequestInvalidError(lastErr) {
+				return cliproxyexecutor.Response{}, lastErr
+			}
 			continue
 		}
 	}
@@ -1084,16 +1217,17 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
-	tried := make(map[string]struct{})
+	excluded := make(map[string]struct{})
+	attempted := make(map[string]struct{})
 	var lastErr error
 	for {
-		if maxRetryCredentials > 0 && len(tried) >= maxRetryCredentials {
+		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
 			}
 			return cliproxyexecutor.Response{}, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
+		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, excluded)
 		if errPick != nil {
 			if lastErr != nil {
 				return cliproxyexecutor.Response{}, lastErr
@@ -1102,10 +1236,17 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 		}
 
 		entry := logEntryWithRequestID(ctx)
+		lease, inFlight, limit, reserved := m.tryReserveAuthExecution(auth)
+		if !reserved {
+			excluded[auth.ID] = struct{}{}
+			debugLogAuthInFlightSkip(entry, auth, req.Model, inFlight, limit)
+			continue
+		}
+		excluded[auth.ID] = struct{}{}
+		attempted[auth.ID] = struct{}{}
 		debugLogAuthSelection(entry, auth, provider, req.Model)
+		debugLogAuthInFlightReserved(entry, auth, req.Model, inFlight, limit)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
-
-		tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -1114,30 +1255,44 @@ func (m *Manager) executeCountMixedOnce(ctx context.Context, providers []string,
 
 		models := m.prepareExecutionModels(auth, routeModel)
 		var authErr error
-		for _, upstreamModel := range models {
-			execReq := req
-			execReq.Model = upstreamModel
-			resp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
-			result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
-			if errExec != nil {
-				if errCtx := execCtx.Err(); errCtx != nil {
-					return cliproxyexecutor.Response{}, errCtx
-				}
-				result.Error = &Error{Message: errExec.Error()}
-				if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
-					result.Error.HTTPStatus = se.StatusCode()
-				}
-				if ra := retryAfterFromError(errExec); ra != nil {
-					result.RetryAfter = ra
+		var (
+			resp   cliproxyexecutor.Response
+			respOK bool
+		)
+		func() {
+			defer lease.Release()
+			for _, upstreamModel := range models {
+				execReq := req
+				execReq.Model = upstreamModel
+				currentResp, errExec := executor.CountTokens(execCtx, auth, execReq, opts)
+				result := Result{AuthID: auth.ID, Provider: provider, Model: routeModel, Success: errExec == nil}
+				if errExec != nil {
+					if errCtx := execCtx.Err(); errCtx != nil {
+						authErr = errCtx
+						return
+					}
+					result.Error = &Error{Message: errExec.Error()}
+					if se, ok := errors.AsType[cliproxyexecutor.StatusError](errExec); ok && se != nil {
+						result.Error.HTTPStatus = se.StatusCode()
+					}
+					if ra := retryAfterFromError(errExec); ra != nil {
+						result.RetryAfter = ra
+					}
+					m.hook.OnResult(execCtx, result)
+					authErr = errExec
+					if isRequestInvalidError(errExec) {
+						return
+					}
+					continue
 				}
 				m.hook.OnResult(execCtx, result)
-				if isRequestInvalidError(errExec) {
-					return cliproxyexecutor.Response{}, errExec
-				}
-				authErr = errExec
-				continue
+				resp = currentResp
+				respOK = true
+				authErr = nil
+				return
 			}
-			m.hook.OnResult(execCtx, result)
+		}()
+		if respOK {
 			return resp, nil
 		}
 		if authErr != nil {
@@ -1156,16 +1311,17 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 	}
 	routeModel := req.Model
 	opts = ensureRequestedModelMetadata(opts, routeModel)
-	tried := make(map[string]struct{})
+	excluded := make(map[string]struct{})
+	attempted := make(map[string]struct{})
 	var lastErr error
 	for {
-		if maxRetryCredentials > 0 && len(tried) >= maxRetryCredentials {
+		if maxRetryCredentials > 0 && len(attempted) >= maxRetryCredentials {
 			if lastErr != nil {
 				return nil, lastErr
 			}
 			return nil, &Error{Code: "auth_not_found", Message: "no auth available"}
 		}
-		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, tried)
+		auth, executor, provider, errPick := m.pickNextMixed(ctx, providers, routeModel, opts, excluded)
 		if errPick != nil {
 			if lastErr != nil {
 				return nil, lastErr
@@ -1174,10 +1330,17 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 
 		entry := logEntryWithRequestID(ctx)
+		lease, inFlight, limit, reserved := m.tryReserveAuthExecution(auth)
+		if !reserved {
+			excluded[auth.ID] = struct{}{}
+			debugLogAuthInFlightSkip(entry, auth, req.Model, inFlight, limit)
+			continue
+		}
+		excluded[auth.ID] = struct{}{}
+		attempted[auth.ID] = struct{}{}
 		debugLogAuthSelection(entry, auth, provider, req.Model)
+		debugLogAuthInFlightReserved(entry, auth, req.Model, inFlight, limit)
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
-
-		tried[auth.ID] = struct{}{}
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -1185,6 +1348,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel)
 		if errStream != nil {
+			lease.Release()
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
@@ -1194,7 +1358,7 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			lastErr = errStream
 			continue
 		}
-		return streamResult, nil
+		return wrapStreamResultWithFinalizer(streamResult, lease.Release), nil
 	}
 }
 
@@ -2142,6 +2306,9 @@ func (m *Manager) pickNextLegacy(ctx context.Context, provider, model string, op
 		if candidate.Provider != provider || candidate.Disabled {
 			continue
 		}
+		if m.isAuthExecutionSaturatedLocked(candidate) {
+			continue
+		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
 			continue
 		}
@@ -2238,6 +2405,9 @@ func (m *Manager) pickNextMixedLegacy(ctx context.Context, providers []string, m
 	registryRef := registry.GetGlobalRegistry()
 	for _, candidate := range m.auths {
 		if candidate == nil || candidate.Disabled {
+			continue
+		}
+		if m.isAuthExecutionSaturatedLocked(candidate) {
 			continue
 		}
 		if pinnedAuthID != "" && candidate.ID != pinnedAuthID {
@@ -2802,6 +2972,26 @@ func debugLogAuthSelection(entry *log.Entry, auth *Auth, provider string, model 
 		ident := formatOauthIdentity(auth, provider, accountInfo)
 		entry.Debugf("Use OAuth %s for model %s%s", ident, model, suffix)
 	}
+}
+
+func debugLogAuthInFlightSkip(entry *log.Entry, auth *Auth, model string, inFlight, limit int) {
+	if !log.IsLevelEnabled(log.DebugLevel) {
+		return
+	}
+	if entry == nil || auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return
+	}
+	entry.Debugf("codex-select skip_inflight auth=%s model=%s in_flight=%d limit=%d", strings.TrimSpace(auth.ID), strings.TrimSpace(model), inFlight, limit)
+}
+
+func debugLogAuthInFlightReserved(entry *log.Entry, auth *Auth, model string, inFlight, limit int) {
+	if !log.IsLevelEnabled(log.DebugLevel) {
+		return
+	}
+	if entry == nil || auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
+		return
+	}
+	entry.Debugf("codex-select reserved auth=%s model=%s in_flight=%d limit=%d", strings.TrimSpace(auth.ID), strings.TrimSpace(model), inFlight, limit)
 }
 
 func formatOauthIdentity(auth *Auth, provider string, accountInfo string) string {

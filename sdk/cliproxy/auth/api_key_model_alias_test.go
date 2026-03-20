@@ -178,3 +178,26 @@ func TestApplyAPIKeyModelAlias(t *testing.T) {
 		})
 	}
 }
+
+func TestShouldRebuildAPIKeyModelAlias_SkipsOAuthAuths(t *testing.T) {
+	t.Parallel()
+
+	oauthAuth := &Auth{ID: "oauth-auth", Provider: "codex", Attributes: map[string]string{"auth_kind": "oauth"}}
+	if shouldRebuildAPIKeyModelAlias(nil, oauthAuth) {
+		t.Fatal("expected oauth auth to skip api key alias rebuild")
+	}
+}
+
+func TestShouldRebuildAPIKeyModelAlias_RebuildsForAPIKeyTransitions(t *testing.T) {
+	t.Parallel()
+
+	apiKeyAuth := &Auth{ID: "api-key-auth", Provider: "codex", Attributes: map[string]string{"api_key": "k"}}
+	oauthAuth := &Auth{ID: "api-key-auth", Provider: "codex", Attributes: map[string]string{"auth_kind": "oauth"}}
+
+	if !shouldRebuildAPIKeyModelAlias(nil, apiKeyAuth) {
+		t.Fatal("expected api_key auth registration to rebuild aliases")
+	}
+	if !shouldRebuildAPIKeyModelAlias(apiKeyAuth, oauthAuth) {
+		t.Fatal("expected api_key to oauth transition to rebuild aliases")
+	}
+}

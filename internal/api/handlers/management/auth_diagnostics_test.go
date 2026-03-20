@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 
 	"github.com/gin-gonic/gin"
@@ -15,13 +16,49 @@ import (
 	coreauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 )
 
+type countingTokenStore struct {
+	inner *sdkAuth.FileTokenStore
+	mu    sync.Mutex
+	saves int
+}
+
+func (s *countingTokenStore) SetBaseDir(dir string) {
+	if s == nil || s.inner == nil {
+		return
+	}
+	s.inner.SetBaseDir(dir)
+}
+
+func (s *countingTokenStore) List(ctx context.Context) ([]*coreauth.Auth, error) {
+	return s.inner.List(ctx)
+}
+
+func (s *countingTokenStore) Save(ctx context.Context, auth *coreauth.Auth) (string, error) {
+	s.mu.Lock()
+	s.saves++
+	s.mu.Unlock()
+	return s.inner.Save(ctx, auth)
+}
+
+func (s *countingTokenStore) Delete(ctx context.Context, id string) error {
+	return s.inner.Delete(ctx, id)
+}
+
+func (s *countingTokenStore) SaveCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.saves
+}
+
 func TestSaveTokenRecordRegistersSavedFileBackedAuth(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 
 	authDir := t.TempDir()
 	manager := coreauth.NewManager(nil, nil, nil)
+	store := &countingTokenStore{inner: sdkAuth.NewFileTokenStore()}
+	manager.SetStore(store)
 	h := NewHandlerWithoutConfigFilePath(&config.Config{AuthDir: authDir}, manager)
-	h.tokenStore = sdkAuth.NewFileTokenStore()
+	h.tokenStore = store
 
 	record := &coreauth.Auth{
 		ID:       "codex-user@example.com-free.json",
@@ -51,6 +88,9 @@ func TestSaveTokenRecordRegistersSavedFileBackedAuth(t *testing.T) {
 	}
 	if auth.ProxyURL != "direct" {
 		t.Fatalf("proxy URL = %q, want direct", auth.ProxyURL)
+	}
+	if got := store.SaveCount(); got != 1 {
+		t.Fatalf("save count = %d, want 1 (store.Save only once during saveTokenRecord)", got)
 	}
 }
 

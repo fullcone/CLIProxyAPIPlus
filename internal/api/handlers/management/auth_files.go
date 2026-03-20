@@ -876,6 +876,7 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 	if len(auths) == 0 {
 		return fmt.Errorf("auth file did not synthesize any auth entries")
 	}
+	regCtx := coreauth.WithSkipPersist(ctx)
 
 	for _, auth := range auths {
 		if auth == nil || strings.TrimSpace(auth.ID) == "" {
@@ -894,12 +895,12 @@ func (h *Handler) registerAuthFromFile(ctx context.Context, path string, data []
 			}
 			auth.NextRefreshAfter = existing.NextRefreshAfter
 			auth.Runtime = existing.Runtime
-			if _, err := h.authManager.Update(ctx, auth); err != nil {
+			if _, err := h.authManager.Update(regCtx, auth); err != nil {
 				return err
 			}
 			continue
 		}
-		if _, err := h.authManager.Register(ctx, auth); err != nil {
+		if _, err := h.authManager.Register(regCtx, auth); err != nil {
 			return err
 		}
 	}

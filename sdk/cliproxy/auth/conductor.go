@@ -809,6 +809,36 @@ func (m *Manager) rebuildAPIKeyModelAliasLocked(cfg *internalconfig.Config) {
 	m.apiKeyModelAlias.Store(out)
 }
 
+func authRequiresAPIKeyModelAliasRebuild(auth *Auth) bool {
+	if auth == nil {
+		return false
+	}
+	kind, _ := auth.AccountInfo()
+	if !strings.EqualFold(strings.TrimSpace(kind), "api_key") {
+		return false
+	}
+	provider := strings.ToLower(strings.TrimSpace(auth.Provider))
+	switch provider {
+	case "gemini", "claude", "codex", "vertex":
+		return true
+	default:
+		providerKey := ""
+		compatName := ""
+		if auth.Attributes != nil {
+			providerKey = strings.TrimSpace(auth.Attributes["provider_key"])
+			compatName = strings.TrimSpace(auth.Attributes["compat_name"])
+		}
+		if providerKey != "" {
+			return true
+		}
+		return compatName != "" || strings.EqualFold(strings.TrimSpace(auth.Provider), "openai-compatibility")
+	}
+}
+
+func shouldRebuildAPIKeyModelAlias(previous, next *Auth) bool {
+	return authRequiresAPIKeyModelAliasRebuild(previous) || authRequiresAPIKeyModelAliasRebuild(next)
+}
+
 func compileAPIKeyModelAliasForModels[T interface {
 	GetName() string
 	GetAlias() string
@@ -919,10 +949,13 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	}
 	auth.EnsureIndex()
 	authClone := auth.Clone()
+	needsAliasRebuild := shouldRebuildAPIKeyModelAlias(nil, authClone)
 	m.mu.Lock()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
-	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	if needsAliasRebuild {
+		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	}
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
 	}
@@ -936,21 +969,26 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	if auth == nil || auth.ID == "" {
 		return nil, nil
 	}
+	var existing *Auth
 	m.mu.Lock()
-	if existing, ok := m.auths[auth.ID]; ok && existing != nil {
+	if current, ok := m.auths[auth.ID]; ok && current != nil {
+		existing = current
 		if !auth.indexAssigned && auth.Index == "" {
-			auth.Index = existing.Index
-			auth.indexAssigned = existing.indexAssigned
+			auth.Index = current.Index
+			auth.indexAssigned = current.indexAssigned
 		}
-		if len(auth.ModelStates) == 0 && len(existing.ModelStates) > 0 {
-			auth.ModelStates = existing.ModelStates
+		if len(auth.ModelStates) == 0 && len(current.ModelStates) > 0 {
+			auth.ModelStates = current.ModelStates
 		}
 	}
 	auth.EnsureIndex()
 	authClone := auth.Clone()
+	needsAliasRebuild := shouldRebuildAPIKeyModelAlias(existing, authClone)
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
-	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	if needsAliasRebuild {
+		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	}
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
 	}

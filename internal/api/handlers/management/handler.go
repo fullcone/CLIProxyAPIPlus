@@ -39,10 +39,13 @@ type Handler struct {
 	configFilePath      string
 	mu                  sync.Mutex
 	attemptsMu          sync.Mutex
+	immediateAuthMu     sync.Mutex
 	failedAttempts      map[string]*attemptInfo // keyed by client IP
 	authManager         *coreauth.Manager
 	usageStats          *usage.RequestStatistics
 	tokenStore          coreauth.Store
+	immediateAuthQueue  chan string
+	immediateAuthDirty  map[string]bool
 	localPassword       string
 	allowRemoteOverride bool
 	envSecret           string
@@ -66,6 +69,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		envSecret:           envSecret,
 	}
 	h.startAttemptCleanup()
+	h.startImmediateAuthRegistrationWorker()
 	return h
 }
 

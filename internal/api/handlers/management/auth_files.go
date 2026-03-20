@@ -1149,8 +1149,10 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	}
 	if h.authManager != nil && strings.TrimSpace(savedPath) != "" {
 		if info, statErr := os.Stat(savedPath); statErr == nil && !info.IsDir() {
-			if errReg := h.registerAuthFromFile(ctx, savedPath, nil); errReg != nil {
-				log.Warnf("saved auth file %s but failed to register immediately: %v", savedPath, errReg)
+			if !h.enqueueImmediateAuthRegistration(savedPath) {
+				if errReg := h.registerAuthFromFile(ctx, savedPath, nil); errReg != nil {
+					log.Warnf("saved auth file %s but failed to register immediately: %v", savedPath, errReg)
+				}
 			}
 		}
 	}

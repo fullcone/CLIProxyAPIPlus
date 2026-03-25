@@ -1640,6 +1640,24 @@ func TestDispatchLoopExitsWhenQueueNilAndContextCanceled(t *testing.T) {
 	}
 }
 
+func TestPendingAndDispatchingAuthUpdateCounts(t *testing.T) {
+	w := &Watcher{
+		pendingUpdates: map[string]AuthUpdate{
+			"a": {ID: "a"},
+			"b": {ID: "b"},
+		},
+		pendingOrder: []string{"a", "b"},
+	}
+	w.dispatchInFlight.Store(3)
+
+	if got := w.PendingAuthUpdateCount(); got != 2 {
+		t.Fatalf("expected pending count 2, got %d", got)
+	}
+	if got := w.DispatchingAuthUpdateCount(); got != 3 {
+		t.Fatalf("expected dispatching count 3, got %d", got)
+	}
+}
+
 func TestReloadClientsFiltersOAuthProvidersWithoutRescan(t *testing.T) {
 	tmp := t.TempDir()
 	w := &Watcher{

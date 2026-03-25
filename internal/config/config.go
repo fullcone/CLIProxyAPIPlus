@@ -45,6 +45,9 @@ type Config struct {
 	// Debug enables or disables debug-level logging and other debug features.
 	Debug bool `yaml:"debug" json:"debug"`
 
+	// IPv6Prefix configures the source IPv6 pool used for per-account Codex binding.
+	IPv6Prefix string `yaml:"ipv6-prefix" json:"ipv6-prefix"`
+
 	// Pprof config controls the optional pprof HTTP debug server.
 	Pprof PprofConfig `yaml:"pprof" json:"pprof"`
 
@@ -684,6 +687,8 @@ func LoadConfigOptional(configFile string, optional bool) (*Config, error) {
 	if cfg.LogsMaxTotalSizeMB < 0 {
 		cfg.LogsMaxTotalSizeMB = 0
 	}
+
+	cfg.IPv6Prefix = strings.TrimSpace(cfg.IPv6Prefix)
 
 	if cfg.ErrorLogsMaxFiles < 0 {
 		cfg.ErrorLogsMaxFiles = 10

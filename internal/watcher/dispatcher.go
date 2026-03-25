@@ -184,9 +184,12 @@ func (w *Watcher) dispatchLoop(ctx context.Context) {
 			continue
 		}
 		for _, update := range batch {
+			w.dispatchInFlight.Add(1)
 			select {
 			case queue <- update:
+				w.dispatchInFlight.Add(-1)
 			case <-ctx.Done():
+				w.dispatchInFlight.Add(-1)
 				return
 			}
 		}
@@ -220,11 +223,30 @@ func (w *Watcher) getAuthQueue() chan<- AuthUpdate {
 	return w.authQueue
 }
 
+// PendingAuthUpdateCount returns the number of watcher-owned auth updates queued for dispatch.
+func (w *Watcher) PendingAuthUpdateCount() int {
+	if w == nil {
+		return 0
+	}
+	w.dispatchMu.Lock()
+	defer w.dispatchMu.Unlock()
+	return len(w.pendingOrder)
+}
+
+// DispatchingAuthUpdateCount returns the number of watcher updates currently blocked while dispatching to the service queue.
+func (w *Watcher) DispatchingAuthUpdateCount() int {
+	if w == nil {
+		return 0
+	}
+	return int(w.dispatchInFlight.Load())
+}
+
 func (w *Watcher) stopDispatch() {
 	if w.dispatchCancel != nil {
 		w.dispatchCancel()
 		w.dispatchCancel = nil
 	}
+	w.dispatchInFlight.Store(0)
 	w.dispatchMu.Lock()
 	w.pendingOrder = nil
 	w.pendingUpdates = nil

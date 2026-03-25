@@ -85,11 +85,13 @@ type WatcherWrapper struct {
 	start func(ctx context.Context) error
 	stop  func() error
 
-	setConfig             func(cfg *config.Config)
-	snapshotAuths         func() []*coreauth.Auth
-	setUpdateQueue        func(queue chan<- watcher.AuthUpdate)
-	dispatchRuntimeUpdate func(update watcher.AuthUpdate) bool
-	notifyTokenRefreshed  func(tokenID, accessToken, refreshToken, expiresAt string) // 方案 A: 后台刷新通知
+	setConfig                  func(cfg *config.Config)
+	snapshotAuths              func() []*coreauth.Auth
+	setUpdateQueue             func(queue chan<- watcher.AuthUpdate)
+	dispatchRuntimeUpdate      func(update watcher.AuthUpdate) bool
+	pendingAuthUpdateCount     func() int
+	dispatchingAuthUpdateCount func() int
+	notifyTokenRefreshed       func(tokenID, accessToken, refreshToken, expiresAt string) // 方案 A: 后台刷新通知
 }
 
 // Start proxies to the underlying watcher Start implementation.
@@ -146,6 +148,22 @@ func (w *WatcherWrapper) SetAuthUpdateQueue(queue chan<- watcher.AuthUpdate) {
 		return
 	}
 	w.setUpdateQueue(queue)
+}
+
+// PendingAuthUpdateCount returns the number of watcher-owned auth updates queued for dispatch.
+func (w *WatcherWrapper) PendingAuthUpdateCount() int {
+	if w == nil || w.pendingAuthUpdateCount == nil {
+		return 0
+	}
+	return w.pendingAuthUpdateCount()
+}
+
+// DispatchingAuthUpdateCount returns the number of watcher updates currently blocked while dispatching to the service queue.
+func (w *WatcherWrapper) DispatchingAuthUpdateCount() int {
+	if w == nil || w.dispatchingAuthUpdateCount == nil {
+		return 0
+	}
+	return w.dispatchingAuthUpdateCount()
 }
 
 // NotifyTokenRefreshed 通知 Watcher 后台刷新器已更新 token

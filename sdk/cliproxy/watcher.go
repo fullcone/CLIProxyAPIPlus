@@ -31,6 +31,12 @@ func defaultWatcherFactory(configPath, authDir string, reload func(*config.Confi
 		dispatchRuntimeUpdate: func(update watcher.AuthUpdate) bool {
 			return w.DispatchRuntimeAuthUpdate(update)
 		},
+		pendingAuthUpdateCount: func() int {
+			return w.PendingAuthUpdateCount()
+		},
+		dispatchingAuthUpdateCount: func() int {
+			return w.DispatchingAuthUpdateCount()
+		},
 		notifyTokenRefreshed: func(tokenID, accessToken, refreshToken, expiresAt string) {
 			w.NotifyTokenRefreshed(tokenID, accessToken, refreshToken, expiresAt)
 		},

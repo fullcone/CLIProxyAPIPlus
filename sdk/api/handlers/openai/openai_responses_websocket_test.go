@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/gorilla/websocket"
@@ -58,8 +59,9 @@ func (s *orderedWebsocketSelector) Pick(_ context.Context, _ string, _ string, _
 }
 
 type websocketAuthCaptureExecutor struct {
-	mu      sync.Mutex
-	authIDs []string
+	mu            sync.Mutex
+	authIDs       []string
+	closedSession []string
 }
 
 func (e *websocketAuthCaptureExecutor) Identifier() string { return "test-provider" }
@@ -97,6 +99,18 @@ func (e *websocketAuthCaptureExecutor) AuthIDs() []string {
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	return append([]string(nil), e.authIDs...)
+}
+
+func (e *websocketAuthCaptureExecutor) CloseExecutionSession(sessionID string) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.closedSession = append(e.closedSession, sessionID)
+}
+
+func (e *websocketAuthCaptureExecutor) ClosedSessions() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return append([]string(nil), e.closedSession...)
 }
 
 func (e *websocketCaptureExecutor) Identifier() string { return "test-provider" }
@@ -660,5 +674,53 @@ func TestResponsesWebsocketPinsOnlyWebsocketCapableAuth(t *testing.T) {
 
 	if got := executor.AuthIDs(); len(got) != 2 || got[0] != "auth-sse" || got[1] != "auth-ws" {
 		t.Fatalf("selected auth IDs = %v, want [auth-sse auth-ws]", got)
+	}
+}
+
+func TestResetPinnedResponsesAuthIfBlockedClosesExecutionSession(t *testing.T) {
+	executor := &websocketAuthCaptureExecutor{}
+	manager := coreauth.NewManager(nil, nil, nil)
+	manager.RegisterExecutor(executor)
+
+	auth := &coreauth.Auth{
+		ID:       "auth-codex",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		Attributes: map[string]string{
+			"websockets": "true",
+		},
+		Unavailable:    true,
+		NextRetryAfter: time.Now().Add(5 * time.Minute),
+		Quota: coreauth.QuotaState{
+			Exceeded:      true,
+			NextRecoverAt: time.Now().Add(5 * time.Minute),
+		},
+	}
+	if _, err := manager.Register(context.Background(), auth); err != nil {
+		t.Fatalf("register auth: %v", err)
+	}
+
+	base := handlers.NewBaseAPIHandlers(&sdkconfig.SDKConfig{}, manager)
+	h := NewOpenAIResponsesAPIHandler(base)
+
+	if got := h.resetPinnedResponsesAuthIfBlocked("session-1", auth.ID, "test-model"); got != "" {
+		t.Fatalf("resetPinnedResponsesAuthIfBlocked returned %q, want empty", got)
+	}
+	if closed := executor.ClosedSessions(); len(closed) != 1 || closed[0] != "session-1" {
+		t.Fatalf("closed sessions = %v, want [session-1]", closed)
+	}
+}
+
+func TestResponsesWebsocketAuthAvailableForModelRejectsTerminalCodexError(t *testing.T) {
+	auth := &coreauth.Auth{
+		ID:       "auth-codex",
+		Provider: "codex",
+		Status:   coreauth.StatusActive,
+		LastError: &coreauth.Error{
+			Message: "token has been invalidated by upstream",
+		},
+	}
+	if responsesWebsocketAuthAvailableForModel(auth, "test-model", time.Now()) {
+		t.Fatal("expected terminal codex error to block pinned auth reuse")
 	}
 }

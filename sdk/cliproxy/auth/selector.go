@@ -362,6 +362,26 @@ func (s *FillFirstSelector) Pick(ctx context.Context, provider, model string, op
 	return available[0], nil
 }
 
+func codexAuthQuotaCooldownUntil(auth *Auth, now time.Time) (time.Time, bool) {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") || !auth.Quota.Exceeded {
+		return time.Time{}, false
+	}
+	next := time.Time{}
+	if auth.NextRetryAfter.After(now) {
+		next = auth.NextRetryAfter
+	}
+	if auth.Quota.NextRecoverAt.After(now) {
+		next = auth.Quota.NextRecoverAt
+	}
+	if next.IsZero() {
+		return time.Time{}, false
+	}
+	if next.Before(now) {
+		next = now
+	}
+	return next, true
+}
+
 func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, blockReason, time.Time) {
 	if auth == nil {
 		return true, blockReasonOther, time.Time{}
@@ -384,6 +404,9 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 				}
 				if state.Unavailable {
 					if state.NextRetryAfter.IsZero() {
+						if next, blocked := codexAuthQuotaCooldownUntil(auth, now); blocked {
+							return true, blockReasonCooldown, next
+						}
 						return false, blockReasonNone, time.Time{}
 					}
 					if state.NextRetryAfter.After(now) {
@@ -400,10 +423,19 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 						return true, blockReasonOther, next
 					}
 				}
+				if next, blocked := codexAuthQuotaCooldownUntil(auth, now); blocked {
+					return true, blockReasonCooldown, next
+				}
 				return false, blockReasonNone, time.Time{}
 			}
 		}
+		if next, blocked := codexAuthQuotaCooldownUntil(auth, now); blocked {
+			return true, blockReasonCooldown, next
+		}
 		return false, blockReasonNone, time.Time{}
+	}
+	if next, blocked := codexAuthQuotaCooldownUntil(auth, now); blocked {
+		return true, blockReasonCooldown, next
 	}
 	if auth.Unavailable && auth.NextRetryAfter.After(now) {
 		next := auth.NextRetryAfter

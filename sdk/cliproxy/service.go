@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
@@ -75,6 +76,8 @@ type Service struct {
 
 	// authQueueStop cancels the auth update queue processing.
 	authQueueStop context.CancelFunc
+	// authApplyInFlight tracks auth updates currently being applied to the core manager.
+	authApplyInFlight atomic.Int64
 
 	// authManager handles legacy authentication operations.
 	authManager *sdkAuth.Manager
@@ -187,6 +190,8 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 	if s == nil {
 		return
 	}
+	s.authApplyInFlight.Add(1)
+	defer s.authApplyInFlight.Add(-1)
 	s.cfgMu.RLock()
 	cfg := s.cfg
 	s.cfgMu.RUnlock()
@@ -210,6 +215,83 @@ func (s *Service) handleAuthUpdate(ctx context.Context, update watcher.AuthUpdat
 		s.applyCoreAuthRemoval(ctx, id)
 	default:
 		log.Debugf("received unknown auth update action: %v", update.Action)
+	}
+}
+
+type authPipelineState struct {
+	serviceQueued      int
+	serviceApplying    int
+	watcherPending     int
+	watcherDispatching int
+}
+
+func (s authPipelineState) stable() bool {
+	return s.serviceQueued == 0 && s.serviceApplying == 0 && s.watcherPending == 0 && s.watcherDispatching == 0
+}
+
+func (s authPipelineState) changedFrom(prev authPipelineState) bool {
+	return s.serviceQueued != prev.serviceQueued || s.serviceApplying != prev.serviceApplying || s.watcherPending != prev.watcherPending || s.watcherDispatching != prev.watcherDispatching
+}
+
+func (s authPipelineState) String() string {
+	return fmt.Sprintf("serviceQueued=%d serviceApplying=%d watcherPending=%d watcherDispatching=%d", s.serviceQueued, s.serviceApplying, s.watcherPending, s.watcherDispatching)
+}
+
+func (s *Service) currentAuthPipelineState() authPipelineState {
+	state := authPipelineState{}
+	if s == nil {
+		return state
+	}
+	if s.authUpdates != nil {
+		state.serviceQueued = len(s.authUpdates)
+	}
+	state.serviceApplying = int(s.authApplyInFlight.Load())
+	if s.watcher != nil {
+		state.watcherPending = s.watcher.PendingAuthUpdateCount()
+		state.watcherDispatching = s.watcher.DispatchingAuthUpdateCount()
+	}
+	return state
+}
+
+func (s *Service) waitForInitialAuthPipelineStable(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+
+	checkTicker := time.NewTicker(100 * time.Millisecond)
+	warnTicker := time.NewTicker(1 * time.Minute)
+	defer checkTicker.Stop()
+	defer warnTicker.Stop()
+
+	lastState := authPipelineState{serviceQueued: -1, serviceApplying: -1, watcherPending: -1, watcherDispatching: -1}
+	stableChecks := 0
+
+	for {
+		state := s.currentAuthPipelineState()
+		if state.stable() {
+			stableChecks++
+			if stableChecks >= 2 {
+				log.Debugf("initial auth pipeline stabilized: %s", state.String())
+				return nil
+			}
+		} else {
+			stableChecks = 0
+			if state.changedFrom(lastState) {
+				log.Debugf("waiting for initial auth pipeline to stabilize: %s", state.String())
+				lastState = state
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-checkTicker.C:
+		case <-warnTicker.C:
+			log.Warnf("still waiting for initial auth pipeline to stabilize: %s", s.currentAuthPipelineState().String())
+		}
 	}
 }
 
@@ -720,6 +802,13 @@ func (s *Service) Run(ctx context.Context) error {
 		interval := 15 * time.Minute
 		s.coreManager.StartAutoRefresh(context.Background(), interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
+	}
+
+	if err = s.waitForInitialAuthPipelineStable(ctx); err != nil {
+		return err
+	}
+	if s.server != nil {
+		s.server.StartCodexCleanup(ctx)
 	}
 
 	select {

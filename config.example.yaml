@@ -71,6 +71,10 @@ usage-statistics-enabled: false
 # Per-entry proxy-url also supports "direct" or "none" to bypass both the global proxy-url and environment proxies explicitly.
 proxy-url: ""
 
+# Optional IPv6 prefix used to bind each Codex OAuth account to a fixed source IPv6.
+# Example: "2001:db8:1234:5678::/64"
+ipv6-prefix: ""
+
 # When true, unprefixed model requests only use credentials without a prefix (except when prefix == model name).
 force-model-prefix: false
 

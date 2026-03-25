@@ -178,6 +178,71 @@ func (e *authFallbackExecutor) StreamCalls() []string {
 	return out
 }
 
+type codexInFlightTestExecutor struct {
+	mu sync.Mutex
+
+	executeCalls []string
+	countCalls   []string
+	streamCalls  []string
+	streamCh     chan cliproxyexecutor.StreamChunk
+}
+
+func (e *codexInFlightTestExecutor) Identifier() string { return "codex" }
+
+func (e *codexInFlightTestExecutor) Execute(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.executeCalls = append(e.executeCalls, auth.ID)
+	e.mu.Unlock()
+	return cliproxyexecutor.Response{Payload: []byte(auth.ID)}, nil
+}
+
+func (e *codexInFlightTestExecutor) ExecuteStream(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (*cliproxyexecutor.StreamResult, error) {
+	e.mu.Lock()
+	e.streamCalls = append(e.streamCalls, auth.ID)
+	ch := e.streamCh
+	e.mu.Unlock()
+	return &cliproxyexecutor.StreamResult{Headers: http.Header{"X-Auth": {auth.ID}}, Chunks: ch}, nil
+}
+
+func (e *codexInFlightTestExecutor) Refresh(_ context.Context, auth *Auth) (*Auth, error) {
+	return auth, nil
+}
+
+func (e *codexInFlightTestExecutor) CountTokens(_ context.Context, auth *Auth, _ cliproxyexecutor.Request, _ cliproxyexecutor.Options) (cliproxyexecutor.Response, error) {
+	e.mu.Lock()
+	e.countCalls = append(e.countCalls, auth.ID)
+	e.mu.Unlock()
+	return cliproxyexecutor.Response{Payload: []byte(auth.ID)}, nil
+}
+
+func (e *codexInFlightTestExecutor) HttpRequest(context.Context, *Auth, *http.Request) (*http.Response, error) {
+	return nil, nil
+}
+
+func (e *codexInFlightTestExecutor) ExecuteCalls() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.executeCalls))
+	copy(out, e.executeCalls)
+	return out
+}
+
+func (e *codexInFlightTestExecutor) CountCalls() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.countCalls))
+	copy(out, e.countCalls)
+	return out
+}
+
+func (e *codexInFlightTestExecutor) StreamCalls() []string {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	out := make([]string, len(e.streamCalls))
+	copy(out, e.streamCalls)
+	return out
+}
+
 func newCredentialRetryLimitTestManager(t *testing.T, maxRetryCredentials int) (*Manager, *credentialRetryLimitExecutor) {
 	t.Helper()
 
@@ -446,4 +511,168 @@ func TestManager_MarkResult_RespectsAuthDisableCoolingOverride(t *testing.T) {
 	if !state.NextRetryAfter.IsZero() {
 		t.Fatalf("expected NextRetryAfter to be zero when disable_cooling=true, got %v", state.NextRetryAfter)
 	}
+}
+
+func TestNextQuotaCooldown_CodexUsesProviderSpecificFallback(t *testing.T) {
+	cooldown, nextLevel := nextQuotaCooldown("codex", 4, false)
+	if cooldown != codexQuotaCooldown {
+		t.Fatalf("codex cooldown = %v, want %v", cooldown, codexQuotaCooldown)
+	}
+	if nextLevel != 4 {
+		t.Fatalf("codex nextLevel = %d, want %d", nextLevel, 4)
+	}
+
+	cooldown, nextLevel = nextQuotaCooldown("claude", 4, false)
+	if cooldown != 16*time.Second {
+		t.Fatalf("claude cooldown = %v, want %v", cooldown, 16*time.Second)
+	}
+	if nextLevel != 5 {
+		t.Fatalf("claude nextLevel = %d, want %d", nextLevel, 5)
+	}
+}
+
+func TestManager_ShouldRefresh_SkipsCodexQuotaCooldown(t *testing.T) {
+	m := NewManager(nil, nil, nil)
+	now := time.Now()
+	auth := &Auth{
+		Provider:       "codex",
+		NextRetryAfter: now.Add(time.Minute),
+		Quota: QuotaState{
+			Exceeded: true,
+		},
+		Metadata: map[string]any{
+			"refresh_interval_seconds": float64(60),
+		},
+	}
+	if m.shouldRefresh(auth, now) {
+		t.Fatal("expected codex auth in quota cooldown to skip refresh")
+	}
+
+	auth.NextRetryAfter = now.Add(-time.Second)
+	if !m.shouldRefresh(auth, now) {
+		t.Fatal("expected codex auth to resume normal refresh checks after cooldown")
+	}
+}
+
+func TestManager_MaxRetryCredentials_IgnoresBusyCodexAuths(t *testing.T) {
+	model := "gpt-5-codex"
+	testCases := []struct {
+		name     string
+		invoke   func(*Manager) (cliproxyexecutor.Response, error)
+		getCalls func(*codexInFlightTestExecutor) []string
+	}{
+		{
+			name: "execute",
+			invoke: func(m *Manager) (cliproxyexecutor.Response, error) {
+				return m.Execute(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+			},
+			getCalls: func(executor *codexInFlightTestExecutor) []string { return executor.ExecuteCalls() },
+		},
+		{
+			name: "execute_count",
+			invoke: func(m *Manager) (cliproxyexecutor.Response, error) {
+				return m.ExecuteCount(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+			},
+			getCalls: func(executor *codexInFlightTestExecutor) []string { return executor.CountCalls() },
+		},
+	}
+
+	for _, testCase := range testCases {
+		testCase := testCase
+		t.Run(testCase.name, func(t *testing.T) {
+			m := NewManager(nil, nil, nil)
+			m.SetRetryConfig(0, 0, 1)
+			executor := &codexInFlightTestExecutor{}
+			m.RegisterExecutor(executor)
+
+			busyAuth := &Auth{ID: "a-busy", Provider: "codex"}
+			freeAuth := &Auth{ID: "b-free", Provider: "codex"}
+
+			reg := registry.GetGlobalRegistry()
+			reg.RegisterClient(busyAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+			reg.RegisterClient(freeAuth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+			t.Cleanup(func() {
+				reg.UnregisterClient(busyAuth.ID)
+				reg.UnregisterClient(freeAuth.ID)
+			})
+
+			if _, errRegister := m.Register(context.Background(), busyAuth); errRegister != nil {
+				t.Fatalf("register busy auth: %v", errRegister)
+			}
+			if _, errRegister := m.Register(context.Background(), freeAuth); errRegister != nil {
+				t.Fatalf("register free auth: %v", errRegister)
+			}
+
+			releaseLease, acquired := m.tryAcquireExecutionLease(busyAuth)
+			if !acquired {
+				t.Fatal("expected preflight lease acquisition for busy auth")
+			}
+			defer releaseLease()
+
+			resp, errInvoke := testCase.invoke(m)
+			if errInvoke != nil {
+				t.Fatalf("invoke error = %v", errInvoke)
+			}
+			if got := string(resp.Payload); got != freeAuth.ID {
+				t.Fatalf("payload = %q, want %q", got, freeAuth.ID)
+			}
+			calls := testCase.getCalls(executor)
+			if len(calls) != 1 || calls[0] != freeAuth.ID {
+				t.Fatalf("calls = %v, want [%q]", calls, freeAuth.ID)
+			}
+		})
+	}
+}
+
+func TestManager_ExecuteStream_CodexLeaseReleasedAfterStreamEnds(t *testing.T) {
+	model := "gpt-5-codex"
+	m := NewManager(nil, nil, nil)
+	executor := &codexInFlightTestExecutor{streamCh: make(chan cliproxyexecutor.StreamChunk, 1)}
+	m.RegisterExecutor(executor)
+
+	auth := &Auth{ID: "stream-auth", Provider: "codex"}
+	reg := registry.GetGlobalRegistry()
+	reg.RegisterClient(auth.ID, "codex", []*registry.ModelInfo{{ID: model}})
+	t.Cleanup(func() {
+		reg.UnregisterClient(auth.ID)
+	})
+
+	if _, errRegister := m.Register(context.Background(), auth); errRegister != nil {
+		t.Fatalf("register auth: %v", errRegister)
+	}
+
+	executor.streamCh <- cliproxyexecutor.StreamChunk{Payload: []byte("chunk-1")}
+	streamResult, errExecute := m.ExecuteStream(context.Background(), []string{"codex"}, cliproxyexecutor.Request{Model: model}, cliproxyexecutor.Options{})
+	if errExecute != nil {
+		t.Fatalf("ExecuteStream() error = %v", errExecute)
+	}
+
+	if releaseLease, acquired := m.tryAcquireExecutionLease(auth); acquired {
+		releaseLease()
+		t.Fatal("expected codex auth lease to remain held while stream is active")
+	}
+
+	firstChunk, ok := <-streamResult.Chunks
+	if !ok {
+		t.Fatal("expected first stream chunk")
+	}
+	if firstChunk.Err != nil {
+		t.Fatalf("first chunk error = %v", firstChunk.Err)
+	}
+	if got := string(firstChunk.Payload); got != "chunk-1" {
+		t.Fatalf("first chunk payload = %q, want %q", got, "chunk-1")
+	}
+
+	close(executor.streamCh)
+	for chunk := range streamResult.Chunks {
+		if chunk.Err != nil {
+			t.Fatalf("stream chunk error = %v", chunk.Err)
+		}
+	}
+
+	releaseLease, acquired := m.tryAcquireExecutionLease(auth)
+	if !acquired {
+		t.Fatal("expected codex auth lease to be released after stream completion")
+	}
+	releaseLease()
 }

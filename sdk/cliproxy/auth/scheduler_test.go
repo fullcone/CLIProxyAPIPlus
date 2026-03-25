@@ -208,6 +208,43 @@ func TestSchedulerPick_CodexWebsocketPrefersWebsocketEnabledSubset(t *testing.T)
 	}
 }
 
+func TestSchedulerPick_CodexAuthQuotaCooldownSkipsActiveModelState(t *testing.T) {
+	t.Parallel()
+
+	model := "gpt-5.2-codex"
+	cooldownUntil := time.Now().Add(30 * time.Minute)
+	registerSchedulerModels(t, "codex", model, "codex-high", "codex-low")
+
+	scheduler := newSchedulerForTest(
+		&RoundRobinSelector{},
+		&Auth{
+			ID:             "codex-high",
+			Provider:       "codex",
+			Attributes:     map[string]string{"priority": "10"},
+			NextRetryAfter: cooldownUntil,
+			Quota: QuotaState{
+				Exceeded:      true,
+				NextRecoverAt: cooldownUntil,
+			},
+			ModelStates: map[string]*ModelState{
+				model: {Status: StatusActive},
+			},
+		},
+		&Auth{ID: "codex-low", Provider: "codex"},
+	)
+
+	got, errPick := scheduler.pickSingle(context.Background(), "codex", model, cliproxyexecutor.Options{}, nil)
+	if errPick != nil {
+		t.Fatalf("pickSingle() error = %v", errPick)
+	}
+	if got == nil {
+		t.Fatalf("pickSingle() auth = nil")
+	}
+	if got.ID != "codex-low" {
+		t.Fatalf("pickSingle() auth.ID = %q, want %q", got.ID, "codex-low")
+	}
+}
+
 func TestSchedulerPick_MixedProvidersUsesProviderRotationOverReadyCandidates(t *testing.T) {
 	t.Parallel()
 

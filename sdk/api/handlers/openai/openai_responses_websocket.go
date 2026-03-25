@@ -200,6 +200,7 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			return
 		}
 		lastResponseOutput = completedOutput
+		pinnedAuthID = h.resetPinnedResponsesAuthIfBlocked(passthroughSessionID, pinnedAuthID, modelName)
 	}
 }
 
@@ -446,35 +447,125 @@ func (h *OpenAIResponsesAPIHandler) websocketUpstreamSupportsIncrementalInputFor
 	return false
 }
 
+func (h *OpenAIResponsesAPIHandler) resetPinnedResponsesAuthIfBlocked(sessionID, pinnedAuthID, modelName string) string {
+	pinnedAuthID = strings.TrimSpace(pinnedAuthID)
+	if pinnedAuthID == "" || h == nil || h.AuthManager == nil {
+		return pinnedAuthID
+	}
+	auth, ok := h.AuthManager.GetByID(pinnedAuthID)
+	if ok && responsesWebsocketAuthAvailableForModel(auth, modelName, time.Now()) {
+		return pinnedAuthID
+	}
+	log.Debugf("responses websocket: unpin auth=%s session=%s model=%s", pinnedAuthID, sessionID, modelName)
+	h.AuthManager.CloseExecutionSession(sessionID)
+	return ""
+}
+
 func responsesWebsocketAuthAvailableForModel(auth *coreauth.Auth, modelName string, now time.Time) bool {
+	_, blocked := responsesWebsocketPinnedAuthBlockReasonForModel(auth, modelName, now)
+	return !blocked
+}
+
+type responsesWebsocketPinnedAuthBlockReason string
+
+const (
+	responsesWebsocketPinnedAuthOK            responsesWebsocketPinnedAuthBlockReason = "ok"
+	responsesWebsocketPinnedAuthMissing       responsesWebsocketPinnedAuthBlockReason = "missing"
+	responsesWebsocketPinnedAuthDisabled      responsesWebsocketPinnedAuthBlockReason = "disabled"
+	responsesWebsocketPinnedAuthModelDisabled responsesWebsocketPinnedAuthBlockReason = "model_disabled"
+	responsesWebsocketPinnedAuthModelCooldown responsesWebsocketPinnedAuthBlockReason = "model_cooldown"
+	responsesWebsocketPinnedAuthCooldown      responsesWebsocketPinnedAuthBlockReason = "cooldown"
+	responsesWebsocketPinnedAuthTerminal      responsesWebsocketPinnedAuthBlockReason = "terminal"
+)
+
+func responsesWebsocketPinnedAuthBlockReasonForModel(auth *coreauth.Auth, modelName string, now time.Time) (responsesWebsocketPinnedAuthBlockReason, bool) {
 	if auth == nil {
-		return false
+		return responsesWebsocketPinnedAuthMissing, true
 	}
 	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
-		return false
+		return responsesWebsocketPinnedAuthDisabled, true
 	}
-	if modelName != "" && len(auth.ModelStates) > 0 {
-		state, ok := auth.ModelStates[modelName]
-		if (!ok || state == nil) && modelName != "" {
-			baseModel := strings.TrimSpace(thinking.ParseSuffix(modelName).ModelName)
-			if baseModel != "" && baseModel != modelName {
-				state, ok = auth.ModelStates[baseModel]
+	if state, ok := responsesWebsocketModelState(auth, modelName); ok && state != nil {
+		if state.Status == coreauth.StatusDisabled {
+			return responsesWebsocketPinnedAuthModelDisabled, true
+		}
+		if state.Unavailable {
+			if !state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now) {
+				return responsesWebsocketPinnedAuthModelCooldown, true
+			}
+			if next, blocked := responsesWebsocketCodexQuotaCooldownUntil(auth, now); blocked && !next.IsZero() {
+				return responsesWebsocketPinnedAuthModelCooldown, true
 			}
 		}
-		if ok && state != nil {
-			if state.Status == coreauth.StatusDisabled {
-				return false
-			}
-			if state.Unavailable && !state.NextRetryAfter.IsZero() && state.NextRetryAfter.After(now) {
-				return false
-			}
-			return true
-		}
+	}
+	if next, blocked := responsesWebsocketCodexQuotaCooldownUntil(auth, now); blocked && !next.IsZero() {
+		return responsesWebsocketPinnedAuthCooldown, true
 	}
 	if auth.Unavailable && !auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(now) {
+		return responsesWebsocketPinnedAuthCooldown, true
+	}
+	if responsesWebsocketHasTerminalCodexError(auth, modelName) {
+		return responsesWebsocketPinnedAuthTerminal, true
+	}
+	return responsesWebsocketPinnedAuthOK, false
+}
+
+func responsesWebsocketModelState(auth *coreauth.Auth, modelName string) (*coreauth.ModelState, bool) {
+	if auth == nil || modelName == "" || len(auth.ModelStates) == 0 {
+		return nil, false
+	}
+	state, ok := auth.ModelStates[modelName]
+	if (!ok || state == nil) && modelName != "" {
+		baseModel := strings.TrimSpace(thinking.ParseSuffix(modelName).ModelName)
+		if baseModel != "" && baseModel != modelName {
+			state, ok = auth.ModelStates[baseModel]
+		}
+	}
+	if !ok || state == nil {
+		return nil, false
+	}
+	return state, true
+}
+
+func responsesWebsocketCodexQuotaCooldownUntil(auth *coreauth.Auth, now time.Time) (time.Time, bool) {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") || !auth.Quota.Exceeded {
+		return time.Time{}, false
+	}
+	next := time.Time{}
+	if auth.NextRetryAfter.After(now) {
+		next = auth.NextRetryAfter
+	}
+	if auth.Quota.NextRecoverAt.After(now) {
+		next = auth.Quota.NextRecoverAt
+	}
+	if next.IsZero() {
+		return time.Time{}, false
+	}
+	if next.Before(now) {
+		next = now
+	}
+	return next, true
+}
+
+func responsesWebsocketHasTerminalCodexError(auth *coreauth.Auth, modelName string) bool {
+	if auth == nil || !strings.EqualFold(strings.TrimSpace(auth.Provider), "codex") {
 		return false
 	}
-	return true
+	if responsesWebsocketErrorContainsTerminalCodexMessage(auth.LastError) {
+		return true
+	}
+	if state, ok := responsesWebsocketModelState(auth, modelName); ok && state != nil {
+		return responsesWebsocketErrorContainsTerminalCodexMessage(state.LastError)
+	}
+	return false
+}
+
+func responsesWebsocketErrorContainsTerminalCodexMessage(err *coreauth.Error) bool {
+	if err == nil {
+		return false
+	}
+	raw := strings.ToLower(strings.TrimSpace(err.Error()))
+	return strings.Contains(raw, "token has been invalidated") || strings.Contains(raw, "account has been deactivated")
 }
 
 func shouldHandleResponsesWebsocketPrewarmLocally(rawJSON []byte, lastRequest []byte, allowIncrementalInputWithPreviousResponseID bool) bool {

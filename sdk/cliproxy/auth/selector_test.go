@@ -351,6 +351,49 @@ func TestFillFirstSelectorPick_ThinkingSuffixFallsBackToBaseModelState(t *testin
 	}
 }
 
+func TestFillFirstSelectorPick_CodexAuthQuotaCooldownFallsBackWithoutMatchingModelState(t *testing.T) {
+	t.Parallel()
+
+	selector := &FillFirstSelector{}
+	now := time.Now()
+	requestedModel := "gpt-5.2-codex(low)"
+	cooldownUntil := now.Add(30 * time.Minute)
+
+	high := &Auth{
+		ID:             "high",
+		Provider:       "codex",
+		Attributes:     map[string]string{"priority": "10"},
+		NextRetryAfter: cooldownUntil,
+		Quota: QuotaState{
+			Exceeded:      true,
+			NextRecoverAt: cooldownUntil,
+		},
+		ModelStates: map[string]*ModelState{
+			"gpt-5.4": {
+				Status:         StatusError,
+				Unavailable:    true,
+				NextRetryAfter: cooldownUntil,
+				Quota: QuotaState{
+					Exceeded:      true,
+					NextRecoverAt: cooldownUntil,
+				},
+			},
+		},
+	}
+	low := &Auth{ID: "low", Provider: "codex", Attributes: map[string]string{"priority": "0"}}
+
+	got, err := selector.Pick(context.Background(), "codex", requestedModel, cliproxyexecutor.Options{}, []*Auth{high, low})
+	if err != nil {
+		t.Fatalf("Pick() error = %v", err)
+	}
+	if got == nil {
+		t.Fatalf("Pick() auth = nil")
+	}
+	if got.ID != "low" {
+		t.Fatalf("Pick() auth.ID = %q, want %q", got.ID, "low")
+	}
+}
+
 func TestRoundRobinSelectorPick_ThinkingSuffixSharesCursor(t *testing.T) {
 	t.Parallel()
 

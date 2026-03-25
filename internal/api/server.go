@@ -269,6 +269,24 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	logDir := logging.ResolveLogDirectory(cfg)
 	s.mgmt.SetLogDirectory(logDir)
+	codexIPv6Hook := func(ctx context.Context, record *auth.Auth) error {
+		hook := managementHandlers.NewCodexIPv6PostAuthHook(s.cfg)
+		if hook == nil {
+			return nil
+		}
+		return hook(ctx, record)
+	}
+	if optionState.postAuthHook != nil {
+		callerHook := optionState.postAuthHook
+		optionState.postAuthHook = func(ctx context.Context, record *auth.Auth) error {
+			if err := callerHook(ctx, record); err != nil {
+				return err
+			}
+			return codexIPv6Hook(ctx, record)
+		}
+	} else {
+		optionState.postAuthHook = codexIPv6Hook
+	}
 	if optionState.postAuthHook != nil {
 		s.mgmt.SetPostAuthHook(optionState.postAuthHook)
 	}
@@ -882,6 +900,14 @@ func (s *Server) Stop(ctx context.Context) error {
 
 	log.Debug("API server stopped")
 	return nil
+}
+
+// StartCodexCleanup starts the background Codex cleanup loop on the management handler.
+func (s *Server) StartCodexCleanup(ctx context.Context) {
+	if s == nil || s.mgmt == nil || ctx == nil {
+		return
+	}
+	s.mgmt.StartCodexCleanup(ctx)
 }
 
 // corsMiddleware returns a Gin middleware handler that adds CORS headers

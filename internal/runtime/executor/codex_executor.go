@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
@@ -32,7 +33,10 @@ const (
 	codexOriginator = "codex_cli_rs"
 )
 
-var dataTag = []byte("data:")
+var (
+	dataTag        = []byte("data:")
+	codexAuthCache sync.Map
+)
 
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
@@ -73,6 +77,7 @@ func (e *CodexExecutor) HttpRequest(ctx context.Context, auth *cliproxyauth.Auth
 	if err := e.PrepareRequest(httpReq, auth); err != nil {
 		return nil, err
 	}
+	logCodexNetworkRoute("http", httpReq.URL.String(), e.cfg, auth)
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	return httpClient.Do(httpReq)
 }
@@ -140,6 +145,7 @@ func (e *CodexExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, re
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	logCodexNetworkRoute("responses", url, e.cfg, auth)
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -244,6 +250,7 @@ func (e *CodexExecutor) executeCompact(ctx context.Context, auth *cliproxyauth.A
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	logCodexNetworkRoute("responses-compact", url, e.cfg, auth)
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
 	if err != nil {
@@ -339,6 +346,7 @@ func (e *CodexExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Au
 		AuthType:  authType,
 		AuthValue: authValue,
 	})
+	logCodexNetworkRoute("responses-stream", url, e.cfg, auth)
 
 	httpClient := newProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpResp, err := httpClient.Do(httpReq)
@@ -557,6 +565,44 @@ func countCodexInputTokens(enc tokenizer.Codec, body []byte) (int64, error) {
 	return int64(count), nil
 }
 
+func codexAuthCacheKey(cfg *config.Config, auth *cliproxyauth.Auth) string {
+	return resolveProxyRouteIdentity(cfg, auth).cacheKey
+}
+
+func codexAuthConfigForRoute(cfg *config.Config, route proxyRouteIdentity) *config.Config {
+	proxyURL := strings.TrimSpace(route.effectiveProxyURL)
+	if cfg == nil {
+		if proxyURL == "" {
+			return nil
+		}
+		cloned := &config.Config{}
+		cloned.ProxyURL = proxyURL
+		return cloned
+	}
+	if strings.TrimSpace(cfg.ProxyURL) == proxyURL {
+		return cfg
+	}
+	cloned := *cfg
+	cloned.ProxyURL = proxyURL
+	return &cloned
+}
+
+func cachedCodexAuthService(cfg *config.Config, auth *cliproxyauth.Auth) *codexauth.CodexAuth {
+	route := resolveProxyRouteIdentity(cfg, auth)
+	cacheKey := route.cacheKey
+	if cached, ok := codexAuthCache.Load(cacheKey); ok {
+		if svc, ok := cached.(*codexauth.CodexAuth); ok && svc != nil {
+			return svc
+		}
+	}
+	svc := codexauth.NewCodexAuth(codexAuthConfigForRoute(cfg, route), route.ipv6)
+	actual, _ := codexAuthCache.LoadOrStore(cacheKey, svc)
+	if cached, ok := actual.(*codexauth.CodexAuth); ok && cached != nil {
+		return cached
+	}
+	return svc
+}
+
 func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*cliproxyauth.Auth, error) {
 	log.Debugf("codex executor: refresh called")
 	if auth == nil {
@@ -571,7 +617,7 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	if refreshToken == "" {
 		return auth, nil
 	}
-	svc := codexauth.NewCodexAuth(e.cfg)
+	svc := cachedCodexAuthService(e.cfg, auth)
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
 		return nil, err

@@ -48,6 +48,14 @@ type Handler struct {
 	envSecret           string
 	logDir              string
 	postAuthHook        coreauth.PostAuthHook
+
+	cleanupMu                        sync.Mutex
+	codexCleanupStarted              bool
+	codexInvalidCounts               map[string]int
+	codexCleanupRounds               int
+	codexCleanupTotalAutoDeleted     int
+	codexCleanupTotalRecovered       int
+	codexCleanupTotalDisabledCleaned int
 }
 
 // NewHandler creates a new management handler instance.
@@ -64,6 +72,7 @@ func NewHandler(cfg *config.Config, configFilePath string, manager *coreauth.Man
 		tokenStore:          sdkAuth.GetTokenStore(),
 		allowRemoteOverride: envSecret != "",
 		envSecret:           envSecret,
+		codexInvalidCounts:  make(map[string]int),
 	}
 	h.startAttemptCleanup()
 	return h

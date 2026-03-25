@@ -16,6 +16,7 @@ import (
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
+	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
 )
 
@@ -36,10 +37,39 @@ type CodexAuth struct {
 
 // NewCodexAuth creates a new CodexAuth service instance.
 // It initializes an HTTP client with proxy settings from the provided configuration.
-func NewCodexAuth(cfg *config.Config) *CodexAuth {
-	return &CodexAuth{
-		httpClient: util.SetProxy(&cfg.SDKConfig, &http.Client{}),
+func NewCodexAuth(cfg *config.Config, ipv6 ...string) *CodexAuth {
+	httpClient := &http.Client{}
+	if len(ipv6) > 0 {
+		if trimmedIPv6 := strings.TrimSpace(ipv6[0]); trimmedIPv6 != "" {
+			if transport, errIPv6 := util.NewIPv6Transport(trimmedIPv6); errIPv6 == nil {
+				httpClient.Transport = transport
+			} else {
+				log.WithError(errIPv6).Warnf("codex auth: failed to configure IPv6 transport for %s", trimmedIPv6)
+			}
+		}
 	}
+
+	proxyURL := ""
+	if cfg != nil {
+		proxyURL = strings.TrimSpace(cfg.ProxyURL)
+	}
+	setting, errParse := proxyutil.Parse(proxyURL)
+	if errParse != nil {
+		log.Errorf("%v", errParse)
+		return &CodexAuth{httpClient: httpClient}
+	}
+	if setting.Mode == proxyutil.ModeProxy {
+		transport, _, errBuild := proxyutil.BuildHTTPTransport(proxyURL)
+		if errBuild != nil {
+			log.Errorf("%v", errBuild)
+		} else if transport != nil {
+			httpClient.Transport = transport
+		}
+	} else if setting.Mode == proxyutil.ModeDirect && httpClient.Transport == nil {
+		httpClient.Transport = proxyutil.NewDirectTransport()
+	}
+
+	return &CodexAuth{httpClient: httpClient}
 }
 
 // GenerateAuthURL creates the OAuth authorization URL with PKCE (Proof Key for Code Exchange).

@@ -178,3 +178,90 @@ func TestApplyAPIKeyModelAlias(t *testing.T) {
 		})
 	}
 }
+
+func TestShouldRebuildAPIKeyModelAliasForAuthChange(t *testing.T) {
+	tests := []struct {
+		name     string
+		previous *Auth
+		current  *Auth
+		want     bool
+	}{
+		{
+			name:    "register oauth codex auth",
+			current: &Auth{Provider: "codex"},
+			want:    false,
+		},
+		{
+			name:    "register codex api key auth",
+			current: &Auth{Provider: "codex", Attributes: map[string]string{"api_key": "k"}},
+			want:    true,
+		},
+		{
+			name:     "update api key auth to oauth",
+			previous: &Auth{Provider: "codex", Attributes: map[string]string{"api_key": "k"}},
+			current:  &Auth{Provider: "codex"},
+			want:     true,
+		},
+		{
+			name:     "update oauth auth only",
+			previous: &Auth{Provider: "codex"},
+			current:  &Auth{Provider: "codex"},
+			want:     false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := shouldRebuildAPIKeyModelAliasForAuthChange(tt.previous, tt.current); got != tt.want {
+				t.Fatalf("shouldRebuildAPIKeyModelAliasForAuthChange() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestAPIKeyModelAliasConfigChanged_OnlyTracksAliasRelevantFields(t *testing.T) {
+	base := &internalconfig.Config{
+		CodexKey: []internalconfig.CodexKey{{
+			APIKey:  "codex-key",
+			BaseURL: "https://codex.example.com",
+			Models:  []internalconfig.CodexModel{{Name: "o3", Alias: "o"}},
+			Headers: map[string]string{"x-test": "a"},
+		}},
+		OpenAICompatibility: []internalconfig.OpenAICompatibility{{
+			Name:    "compat-a",
+			Headers: map[string]string{"x-test": "a"},
+			Models:  []internalconfig.OpenAICompatibilityModel{{Name: "gpt-4.1", Alias: "g41"}},
+		}},
+		CodexHeaderDefaults: internalconfig.CodexHeaderDefaults{UserAgent: "ua-a"},
+	}
+
+	irrelevant := &internalconfig.Config{
+		CodexKey: []internalconfig.CodexKey{{
+			APIKey:  "codex-key",
+			BaseURL: "https://codex.example.com",
+			Models:  []internalconfig.CodexModel{{Name: "o3", Alias: "o"}},
+			Headers: map[string]string{"x-test": "b"},
+		}},
+		OpenAICompatibility: []internalconfig.OpenAICompatibility{{
+			Name:    "compat-a",
+			Headers: map[string]string{"x-test": "b"},
+			Models:  []internalconfig.OpenAICompatibilityModel{{Name: "gpt-4.1", Alias: "g41"}},
+		}},
+		CodexHeaderDefaults: internalconfig.CodexHeaderDefaults{UserAgent: "ua-b"},
+	}
+	if apiKeyModelAliasConfigChanged(base, irrelevant) {
+		t.Fatal("expected non-alias config changes to skip api key alias rebuild")
+	}
+
+	relevant := &internalconfig.Config{
+		CodexKey: []internalconfig.CodexKey{{
+			APIKey:  "codex-key",
+			BaseURL: "https://codex.example.com",
+			Models:  []internalconfig.CodexModel{{Name: "o4", Alias: "o"}},
+		}},
+		OpenAICompatibility: base.OpenAICompatibility,
+	}
+	if !apiKeyModelAliasConfigChanged(base, relevant) {
+		t.Fatal("expected model alias config changes to trigger api key alias rebuild")
+	}
+}

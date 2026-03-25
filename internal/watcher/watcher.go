@@ -55,6 +55,7 @@ type Watcher struct {
 	dispatchCond      *sync.Cond
 	pendingUpdates    map[string]AuthUpdate
 	pendingOrder      []string
+	dispatchInFlight  atomic.Int64
 	dispatchCancel    context.CancelFunc
 	storePersister    storePersister
 	mirroredAuthDir   string

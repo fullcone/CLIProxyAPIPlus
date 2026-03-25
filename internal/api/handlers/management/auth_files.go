@@ -1224,6 +1224,7 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 		return
 	}
 	if auth, ok := h.authManager.GetByID(id); ok {
+		releaseCodexIPv6ForAuth(h.cfg, auth)
 		auth.Disabled = true
 		auth.Status = coreauth.StatusDisabled
 		auth.StatusMessage = "removed via management API"
@@ -1236,6 +1237,7 @@ func (h *Handler) disableAuth(ctx context.Context, id string) {
 		return
 	}
 	if auth, ok := h.authManager.GetByID(authID); ok {
+		releaseCodexIPv6ForAuth(h.cfg, auth)
 		auth.Disabled = true
 		auth.Status = coreauth.StatusDisabled
 		auth.StatusMessage = "removed via management API"
@@ -1285,7 +1287,83 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 			return "", fmt.Errorf("post-auth hook failed: %w", err)
 		}
 	}
-	return store.Save(ctx, record)
+	savedPath, err := store.Save(ctx, record)
+	if err != nil {
+		return "", err
+	}
+	if err = h.registerSavedAuthRecord(ctx, savedPath, record); err != nil {
+		return "", err
+	}
+	return savedPath, nil
+}
+
+func (h *Handler) registerSavedAuthRecord(ctx context.Context, savedPath string, record *coreauth.Auth) error {
+	if h == nil || h.authManager == nil || record == nil {
+		return nil
+	}
+	skipPersistCtx := coreauth.WithSkipPersist(ctx)
+	path := strings.TrimSpace(savedPath)
+	if path != "" {
+		if info, err := os.Stat(path); err == nil && !info.IsDir() {
+			if errRegister := h.registerAuthFromFile(skipPersistCtx, path, nil); errRegister == nil {
+				return nil
+			} else {
+				log.WithError(errRegister).Debugf("failed to register auth from saved file %s, falling back to in-memory record", path)
+			}
+		}
+	}
+
+	auth := record.Clone()
+	if auth == nil {
+		return nil
+	}
+	now := time.Now()
+	if auth.Attributes == nil {
+		auth.Attributes = make(map[string]string)
+	}
+	if path != "" {
+		auth.Attributes["path"] = path
+		auth.Attributes["source"] = path
+		if authID := h.authIDForPath(path); authID != "" {
+			auth.ID = authID
+		}
+		if strings.TrimSpace(auth.FileName) == "" {
+			auth.FileName = filepath.Base(path)
+		}
+	}
+	if strings.TrimSpace(auth.ID) == "" {
+		auth.ID = strings.TrimSpace(auth.FileName)
+	}
+	if strings.TrimSpace(auth.FileName) == "" {
+		auth.FileName = auth.ID
+	}
+	if strings.TrimSpace(auth.Provider) == "" && auth.Metadata != nil {
+		if provider, ok := auth.Metadata["type"].(string); ok {
+			auth.Provider = strings.TrimSpace(provider)
+		}
+	}
+	if strings.TrimSpace(auth.Label) == "" {
+		if email := authEmail(auth); email != "" {
+			auth.Label = email
+		} else {
+			auth.Label = strings.TrimSpace(auth.Provider)
+		}
+	}
+	if auth.Status == "" {
+		auth.Status = coreauth.StatusActive
+	}
+	if auth.CreatedAt.IsZero() {
+		auth.CreatedAt = now
+	}
+	if auth.UpdatedAt.IsZero() {
+		auth.UpdatedAt = now
+	}
+	if auth.LastRefreshedAt.IsZero() {
+		if ts, ok := extractLastRefreshTimestamp(auth.Metadata); ok {
+			auth.LastRefreshedAt = ts
+		}
+	}
+	return h.upsertAuthRecord(skipPersistCtx, auth)
 }
 
 func gitLabBaseURLFromRequest(c *gin.Context) string {
@@ -1851,6 +1929,67 @@ func (h *Handler) RequestGeminiCLIToken(c *gin.Context) {
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})
 }
 
+var codexTokenExchangeRetryBackoffs = []time.Duration{2 * time.Second, 4 * time.Second, 8 * time.Second}
+
+func exchangeCodexTokensWithRetry(ctx context.Context, exchange func(context.Context) (*codex.CodexAuthBundle, error)) (*codex.CodexAuthBundle, error) {
+	const maxAttempts = 4
+	var lastErr error
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		bundle, err := exchange(ctx)
+		if err == nil {
+			return bundle, nil
+		}
+		lastErr = err
+		if attempt >= maxAttempts || !isRetryableCodexExchangeError(err) {
+			return nil, err
+		}
+		delay := codexTokenExchangeRetryBackoffs[attempt-1]
+		log.WithError(err).Warnf("Codex token exchange attempt %d/%d failed, retrying in %s", attempt, maxAttempts, delay)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return nil, lastErr
+}
+
+func isRetryableCodexExchangeError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	raw := strings.ToLower(err.Error())
+	if strings.Contains(raw, "connection reset") || strings.Contains(raw, "connection refused") || strings.Contains(raw, "timeout") {
+		return true
+	}
+	return hasRetryableCodexExchangeStatus(raw)
+}
+
+func hasRetryableCodexExchangeStatus(raw string) bool {
+	for idx := strings.Index(raw, "status "); idx >= 0; idx = strings.Index(raw, "status ") {
+		raw = raw[idx+len("status "):]
+		end := 0
+		for end < len(raw) && raw[end] >= '0' && raw[end] <= '9' {
+			end++
+		}
+		if end == 3 && raw[0] == '5' {
+			return true
+		}
+		if end >= len(raw) {
+			break
+		}
+		raw = raw[end:]
+	}
+	return false
+}
+
 func (h *Handler) RequestCodexToken(c *gin.Context) {
 	ctx := context.Background()
 	ctx = PopulateAuthContext(ctx, c)
@@ -1873,12 +2012,21 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		return
 	}
 
+	exchangeReservationKey := "codex-oauth:" + state
+	exchangeIPv6, err := reserveCodexIPv6ForOwner(h.cfg, exchangeReservationKey)
+	if err != nil {
+		log.WithError(err).Error("failed to reserve codex IPv6")
+		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to reserve codex ipv6"})
+		return
+	}
+
 	// Initialize Codex auth service
-	openaiAuth := codex.NewCodexAuth(h.cfg)
+	openaiAuth := codex.NewCodexAuth(h.cfg, exchangeIPv6)
 
 	// Generate authorization URL
 	authURL, err := openaiAuth.GenerateAuthURL(state, pkceCodes)
 	if err != nil {
+		releaseCodexIPv6Owner(h.cfg, exchangeReservationKey)
 		log.Errorf("Failed to generate authorization URL: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to generate authorization url"})
 		return
@@ -1891,12 +2039,14 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 	if isWebUI {
 		targetURL, errTarget := h.managementCallbackURL("/codex/callback")
 		if errTarget != nil {
+			releaseCodexIPv6Owner(h.cfg, exchangeReservationKey)
 			log.WithError(errTarget).Error("failed to compute codex callback target")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "callback server unavailable"})
 			return
 		}
 		var errStart error
 		if forwarder, errStart = startCallbackForwarder(codexCallbackPort, "codex", targetURL); errStart != nil {
+			releaseCodexIPv6Owner(h.cfg, exchangeReservationKey)
 			log.WithError(errStart).Error("failed to start codex callback forwarder")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "failed to start callback server"})
 			return
@@ -1904,6 +2054,7 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 	}
 
 	go func() {
+		defer releaseCodexIPv6Owner(h.cfg, exchangeReservationKey)
 		if isWebUI {
 			defer stopCallbackForwarderInstance(codexCallbackPort, forwarder)
 		}
@@ -1946,7 +2097,9 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 
 		log.Debug("Authorization code received, exchanging for tokens...")
 		// Exchange code for tokens using internal auth service
-		bundle, errExchange := openaiAuth.ExchangeCodeForTokens(ctx, code, pkceCodes)
+		bundle, errExchange := exchangeCodexTokensWithRetry(ctx, func(retryCtx context.Context) (*codex.CodexAuthBundle, error) {
+			return openaiAuth.ExchangeCodeForTokens(retryCtx, code, pkceCodes)
+		})
 		if errExchange != nil {
 			authErr := codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, errExchange)
 			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
@@ -1979,8 +2132,16 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 				"account_id": tokenStorage.AccountID,
 			},
 		}
+		if exchangeIPv6 != "" {
+			record.Metadata["ipv6"] = exchangeIPv6
+			if errTransfer := transferCodexIPv6Owner(h.cfg, exchangeReservationKey, record.ID, exchangeIPv6); errTransfer != nil {
+				log.WithError(errTransfer).Warnf("codex ipv6 pool: failed to transfer owner %s to %s", exchangeReservationKey, record.ID)
+				delete(record.Metadata, "ipv6")
+			}
+		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
+			releaseCodexIPv6Owner(h.cfg, record.ID)
 			SetOAuthSessionError(state, "Failed to save authentication tokens")
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
 			return
@@ -1991,7 +2152,6 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		}
 		fmt.Println("You can now use Codex services through this CLI")
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("codex")
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})

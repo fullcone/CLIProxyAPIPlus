@@ -2,12 +2,14 @@ package helps
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/config"
+	"github.com/router-for-me/CLIProxyAPI/v6/internal/util"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v6/sdk/cliproxy/auth"
 	"github.com/router-for-me/CLIProxyAPI/v6/sdk/proxyutil"
 	log "github.com/sirupsen/logrus"
@@ -18,6 +20,37 @@ var (
 	httpClientCache      = make(map[string]*http.Client)
 	httpClientCacheMutex sync.RWMutex
 )
+
+// NormalizeRouteKey builds a stable cache key from proxy, auth, and IPv6 settings.
+// It is exported so that other packages (e.g. codex_executor) can derive
+// the same key for their own caches.
+func NormalizeRouteKey(proxyURL string, authID string, ipv6 string) string {
+	mode := "inherit"
+	trimmed := strings.TrimSpace(proxyURL)
+	if trimmed != "" {
+		setting, err := proxyutil.Parse(trimmed)
+		if err != nil {
+			// Fallback: use raw string when parsing fails.
+			mode = trimmed
+		} else {
+			switch setting.Mode {
+			case proxyutil.ModeDirect:
+				mode = "direct"
+			case proxyutil.ModeProxy:
+				if setting.URL != nil {
+					mode = strings.ToLower(setting.URL.Scheme) + "://" + strings.ToLower(setting.URL.Host)
+				} else {
+					mode = trimmed
+				}
+			case proxyutil.ModeInherit:
+				mode = "inherit"
+			default:
+				mode = trimmed
+			}
+		}
+	}
+	return fmt.Sprintf("route:%s|auth:%s|ipv6:%s", mode, authID, ipv6)
+}
 
 // NewProxyAwareHTTPClient creates an HTTP client with proper proxy configuration priority:
 // 1. Use auth.ProxyURL if configured (highest priority)
@@ -46,10 +79,37 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
 
+	// Build normalized cache key incorporating auth identity and IPv6 setting.
+	var authID, ipv6 string
+	if auth != nil {
+		authID = auth.ID
+		if auth.Metadata != nil {
+			if v, ok := auth.Metadata["ipv6"].(string); ok {
+				ipv6 = v
+			}
+		}
+	}
+	cacheKey := NormalizeRouteKey(proxyURL, authID, ipv6)
+
+	// Codex network diagnostic debug log.
+	if auth != nil && auth.Provider == "codex" {
+		netMode := "direct-default"
+		if proxyURL != "" {
+			netMode = "proxy-explicit"
+			setting, err := proxyutil.Parse(proxyURL)
+			if err == nil && setting.Mode == proxyutil.ModeDirect {
+				netMode = "proxy-default"
+			}
+		} else if ipv6 != "" {
+			netMode = "direct-ipv6-freebind"
+		}
+		log.Debugf("codex-net-mode=%s codex-net-auth=%s", netMode, authID)
+	}
+
 	// If we have a proxy URL configured, try cache first to reuse TCP/TLS connections.
 	if proxyURL != "" {
 		httpClientCacheMutex.RLock()
-		if cachedClient, ok := httpClientCache[proxyURL]; ok {
+		if cachedClient, ok := httpClientCache[cacheKey]; ok {
 			httpClientCacheMutex.RUnlock()
 			if timeout > 0 {
 				return &http.Client{Transport: cachedClient.Transport, Timeout: timeout}
@@ -72,12 +132,22 @@ func NewProxyAwareHTTPClient(ctx context.Context, cfg *config.Config, auth *clip
 			httpClient.Transport = transport
 			// Cache the client
 			httpClientCacheMutex.Lock()
-			httpClientCache[proxyURL] = httpClient
+			httpClientCache[cacheKey] = httpClient
 			httpClientCacheMutex.Unlock()
 			return httpClient
 		}
 		// If proxy setup failed, log and fall through to context RoundTripper
 		log.Debugf("failed to setup proxy from URL: %s, falling back to context transport", proxyURL)
+	}
+
+	// Priority 2.5: If no proxy or direct/none, use IPv6 transport when available.
+	if ipv6 != "" && isDirectOrNoneProxy(proxyURL) {
+		transport := util.NewIPv6Transport(ipv6)
+		httpClient.Transport = transport
+		httpClientCacheMutex.Lock()
+		httpClientCache[cacheKey] = httpClient
+		httpClientCacheMutex.Unlock()
+		return httpClient
 	}
 
 	// Priority 3: Use RoundTripper from context (typically from RoundTripperFor)
@@ -103,4 +173,17 @@ func buildProxyTransport(proxyURL string) *http.Transport {
 		return nil
 	}
 	return transport
+}
+
+// isDirectOrNoneProxy returns true when the proxy URL indicates no proxy should be used.
+func isDirectOrNoneProxy(proxyURL string) bool {
+	trimmed := strings.TrimSpace(strings.ToLower(proxyURL))
+	if trimmed == "" || trimmed == "direct" || trimmed == "none" {
+		return true
+	}
+	setting, err := proxyutil.Parse(proxyURL)
+	if err != nil {
+		return false
+	}
+	return setting.Mode == proxyutil.ModeDirect || setting.Mode == proxyutil.ModeInherit
 }

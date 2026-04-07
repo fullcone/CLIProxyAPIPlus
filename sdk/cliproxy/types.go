@@ -90,6 +90,7 @@ type WatcherWrapper struct {
 	setUpdateQueue        func(queue chan<- watcher.AuthUpdate)
 	dispatchRuntimeUpdate func(update watcher.AuthUpdate) bool
 	notifyTokenRefreshed  func(tokenID, accessToken, refreshToken, expiresAt string) // 方案 A: 后台刷新通知
+	pendingUpdateCount    func() int
 }
 
 // Start proxies to the underlying watcher Start implementation.
@@ -146,6 +147,15 @@ func (w *WatcherWrapper) SetAuthUpdateQueue(queue chan<- watcher.AuthUpdate) {
 		return
 	}
 	w.setUpdateQueue(queue)
+}
+
+// PendingUpdateCount returns the number of auth updates queued in the watcher
+// but not yet dispatched to the auth update channel.
+func (w *WatcherWrapper) PendingUpdateCount() int {
+	if w == nil || w.pendingUpdateCount == nil {
+		return 0
+	}
+	return w.pendingUpdateCount()
 }
 
 // NotifyTokenRefreshed 通知 Watcher 后台刷新器已更新 token

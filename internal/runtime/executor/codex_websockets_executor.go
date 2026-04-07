@@ -63,10 +63,11 @@ type codexWebsocketSession struct {
 
 	reqMu sync.Mutex
 
-	connMu sync.Mutex
-	conn   *websocket.Conn
-	wsURL  string
-	authID string
+	connMu   sync.Mutex
+	conn     *websocket.Conn
+	wsURL    string
+	authID   string
+	pingStop chan struct{} // closed when active ping ticker should stop
 
 	writeMu sync.Mutex
 
@@ -239,6 +240,12 @@ func (e *CodexWebsocketsExecutor) Execute(ctx context.Context, auth *cliproxyaut
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
+			return e.CodexExecutor.Execute(ctx, auth, req, opts)
+		}
+		// Fall back to HTTP for pre-first-message network errors (connection
+		// refused, dial timeout, TLS handshake failure, etc.).
+		if respHS == nil && isPreFirstMessageNetworkError(errDial) {
+			log.Debugf("codex websockets executor: pre-connect network error, falling back to HTTP: %v", errDial)
 			return e.CodexExecutor.Execute(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
@@ -437,6 +444,11 @@ func (e *CodexWebsocketsExecutor) ExecuteStream(ctx context.Context, auth *clipr
 			helps.RecordAPIWebsocketUpgradeRejection(ctx, e.cfg, websocketUpgradeRequestLog(wsReqLog), respHS.StatusCode, respHS.Header.Clone(), bodyErr)
 		}
 		if respHS != nil && respHS.StatusCode == http.StatusUpgradeRequired {
+			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
+		}
+		// Fall back to HTTP for pre-first-message network errors.
+		if respHS == nil && isPreFirstMessageNetworkError(errDial) {
+			log.Debugf("codex websockets executor: pre-connect network error, falling back to HTTP stream: %v", errDial)
 			return e.CodexExecutor.ExecuteStream(ctx, auth, req, opts)
 		}
 		if respHS != nil && respHS.StatusCode > 0 {
@@ -714,6 +726,19 @@ func newProxyAwareWebsocketDialer(cfg *config.Config, auth *cliproxyauth.Auth) *
 	if proxyURL == "" && cfg != nil {
 		proxyURL = strings.TrimSpace(cfg.ProxyURL)
 	}
+
+	// When there is no proxy (or direct/none), use IPv6 dialer if available.
+	if isDirectOrNoneWebsocketProxy(proxyURL) {
+		if auth != nil && auth.Metadata != nil {
+			if ipv6Addr, ok := auth.Metadata["ipv6"].(string); ok && strings.TrimSpace(ipv6Addr) != "" {
+				ipv6Dialer := util.NewIPv6Dialer(strings.TrimSpace(ipv6Addr))
+				dialer.NetDialContext = ipv6Dialer.DialContext
+				dialer.Proxy = nil
+				log.Debugf("codex websockets: using IPv6 dialer addr=%s", ipv6Addr)
+			}
+		}
+	}
+
 	if proxyURL == "" {
 		return dialer
 	}
@@ -1152,10 +1177,13 @@ func (e *CodexWebsocketsExecutor) ensureUpstreamConn(ctx context.Context, auth *
 	sess.wsURL = wsURL
 	sess.authID = authID
 	sess.readerConn = conn
+	pingStop := make(chan struct{})
+	sess.pingStop = pingStop
 	sess.connMu.Unlock()
 
 	sess.configureConn(conn)
 	go e.readUpstreamLoop(sess, conn)
+	e.startActivePingTicker(sess, conn, 30*time.Second, pingStop)
 	logCodexWebsocketConnected(sess.sessionID, authID, wsURL)
 	return conn, resp, nil
 }
@@ -1239,7 +1267,14 @@ func (e *CodexWebsocketsExecutor) invalidateUpstreamConn(sess *codexWebsocketSes
 	if sess.readerConn == conn {
 		sess.readerConn = nil
 	}
+	pingStop := sess.pingStop
+	sess.pingStop = nil
 	sess.connMu.Unlock()
+
+	// Stop the active ping ticker for this connection.
+	if pingStop != nil {
+		close(pingStop)
+	}
 
 	logCodexWebsocketDisconnected(sessionID, authID, wsURL, reason, err)
 	if errClose := conn.Close(); errClose != nil {
@@ -1320,7 +1355,13 @@ func closeCodexWebsocketSession(sess *codexWebsocketSession, reason string) {
 		sess.readerConn = nil
 	}
 	sessionID := sess.sessionID
+	pingStop := sess.pingStop
+	sess.pingStop = nil
 	sess.connMu.Unlock()
+
+	if pingStop != nil {
+		close(pingStop)
+	}
 
 	if conn == nil {
 		return
@@ -1478,6 +1519,75 @@ func (e *CodexAutoExecutor) CloseExecutionSession(sessionID string) {
 		return
 	}
 	e.wsExec.CloseExecutionSession(sessionID)
+}
+
+// isDirectOrNoneWebsocketProxy returns true when the proxy setting indicates no
+// proxy should be used (empty, direct, none, or parsed as ModeDirect/ModeInherit).
+func isDirectOrNoneWebsocketProxy(proxyURL string) bool {
+	trimmed := strings.TrimSpace(strings.ToLower(proxyURL))
+	if trimmed == "" || trimmed == "direct" || trimmed == "none" {
+		return true
+	}
+	setting, err := proxyutil.Parse(proxyURL)
+	if err != nil {
+		return false
+	}
+	return setting.Mode == proxyutil.ModeDirect || setting.Mode == proxyutil.ModeInherit
+}
+
+// startActivePingTicker starts a goroutine that sends WebSocket ping frames at
+// the given interval to keep the upstream connection alive.  The goroutine stops
+// when stopCh is closed or a write error occurs (in which case it calls
+// invalidateUpstreamConn).
+func (e *CodexWebsocketsExecutor) startActivePingTicker(sess *codexWebsocketSession, conn *websocket.Conn, interval time.Duration, stopCh <-chan struct{}) {
+	if sess == nil || conn == nil || interval <= 0 {
+		return
+	}
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stopCh:
+				return
+			case <-ticker.C:
+				sess.writeMu.Lock()
+				err := conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(10*time.Second))
+				sess.writeMu.Unlock()
+				if err != nil {
+					log.Debugf("codex websockets: active ping failed session=%s err=%v", sess.sessionID, err)
+					e.invalidateUpstreamConn(sess, conn, "ping_failed", err)
+					return
+				}
+			}
+		}
+	}()
+}
+
+// isPreFirstMessageNetworkError returns true when the error looks like a
+// network-level failure that occurred before any upstream data was received.
+func isPreFirstMessageNetworkError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case strings.Contains(msg, "connection refused"):
+		return true
+	case strings.Contains(msg, "dial tcp"), strings.Contains(msg, "dial timeout"):
+		return true
+	case strings.Contains(msg, "i/o timeout"):
+		return true
+	case strings.Contains(msg, "tls handshake"):
+		return true
+	case strings.Contains(msg, "no such host"):
+		return true
+	case strings.Contains(msg, "network is unreachable"):
+		return true
+	case strings.Contains(msg, "connection reset"):
+		return true
+	}
+	return false
 }
 
 func codexWebsocketsEnabled(auth *cliproxyauth.Auth) bool {

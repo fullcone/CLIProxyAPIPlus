@@ -11,6 +11,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -36,10 +37,42 @@ type CodexAuth struct {
 
 // NewCodexAuth creates a new CodexAuth service instance.
 // It initializes an HTTP client with proxy settings from the provided configuration.
-func NewCodexAuth(cfg *config.Config) *CodexAuth {
-	return &CodexAuth{
-		httpClient: util.SetProxy(&cfg.SDKConfig, &http.Client{}),
+// If an optional ipv6 address is provided, the HTTP client binds outgoing
+// connections to that address (with IP_FREEBIND on Linux).  When the proxy
+// setting is "direct" or "none", the IPv6 transport is preserved; otherwise the
+// proxy transport takes precedence.
+func NewCodexAuth(cfg *config.Config, ipv6 ...string) *CodexAuth {
+	client := &http.Client{}
+
+	ipv6Addr := ""
+	if len(ipv6) > 0 {
+		ipv6Addr = strings.TrimSpace(ipv6[0])
 	}
+
+	if ipv6Addr != "" {
+		client.Transport = util.NewIPv6Transport(ipv6Addr)
+	}
+
+	// Apply proxy configuration.  When the proxy is direct/none and an IPv6
+	// transport is already set, keep it instead of overwriting.
+	if cfg != nil {
+		proxyURL := strings.TrimSpace(cfg.SDKConfig.ProxyURL)
+		if ipv6Addr != "" && isDirectOrNone(proxyURL) {
+			// Keep the IPv6 transport - do not apply proxy.
+		} else {
+			client = util.SetProxy(&cfg.SDKConfig, client)
+		}
+	}
+
+	return &CodexAuth{
+		httpClient: client,
+	}
+}
+
+// isDirectOrNone returns true when the proxy URL indicates no proxy should be used.
+func isDirectOrNone(proxyURL string) bool {
+	proxyURL = strings.TrimSpace(strings.ToLower(proxyURL))
+	return proxyURL == "" || proxyURL == "direct" || proxyURL == "none"
 }
 
 // GenerateAuthURL creates the OAuth authorization URL with PKCE (Proof Key for Code Exchange).
@@ -202,7 +235,17 @@ func (o *CodexAuth) RefreshTokens(ctx context.Context, refreshToken string) (*Co
 	}
 
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("token refresh failed with status %d: %s", resp.StatusCode, string(body))
+		refreshErr := &RefreshError{
+			Msg:  fmt.Sprintf("token refresh failed with status %d: %s", resp.StatusCode, string(body)),
+			Code: resp.StatusCode,
+		}
+		if ra := resp.Header.Get("Retry-After"); ra != "" {
+			if secs, parseErr := strconv.Atoi(ra); parseErr == nil && secs > 0 {
+				d := time.Duration(secs) * time.Second
+				refreshErr.Retry = &d
+			}
+		}
+		return nil, refreshErr
 	}
 
 	var tokenResp struct {

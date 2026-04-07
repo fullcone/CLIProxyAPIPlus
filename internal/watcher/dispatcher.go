@@ -220,6 +220,14 @@ func (w *Watcher) getAuthQueue() chan<- AuthUpdate {
 	return w.authQueue
 }
 
+// PendingUpdateCount returns the number of auth updates queued but not yet dispatched.
+func (w *Watcher) PendingUpdateCount() int {
+	w.dispatchMu.Lock()
+	n := len(w.pendingOrder)
+	w.dispatchMu.Unlock()
+	return n
+}
+
 func (w *Watcher) stopDispatch() {
 	if w.dispatchCancel != nil {
 		w.dispatchCancel()

@@ -269,8 +269,26 @@ func NewServer(cfg *config.Config, authManager *auth.Manager, accessManager *sdk
 	}
 	logDir := logging.ResolveLogDirectory(cfg)
 	s.mgmt.SetLogDirectory(logDir)
-	if optionState.postAuthHook != nil {
-		s.mgmt.SetPostAuthHook(optionState.postAuthHook)
+	// Compose post-auth hooks: optional caller hook + IPv6 allocation hook.
+	var composedHook auth.PostAuthHook
+	if strings.TrimSpace(cfg.IPv6Prefix) != "" {
+		ipv6Hook := managementHandlers.NewIPv6PostAuthHook(cfg.IPv6Prefix)
+		if optionState.postAuthHook != nil {
+			outer := optionState.postAuthHook
+			composedHook = func(ctx context.Context, record *auth.Auth) error {
+				if err := outer(ctx, record); err != nil {
+					return err
+				}
+				return ipv6Hook(ctx, record)
+			}
+		} else {
+			composedHook = ipv6Hook
+		}
+	} else {
+		composedHook = optionState.postAuthHook
+	}
+	if composedHook != nil {
+		s.mgmt.SetPostAuthHook(composedHook)
 	}
 	s.localPassword = optionState.localPassword
 
@@ -1063,6 +1081,14 @@ func (s *Server) UpdateClients(cfg *config.Config) {
 		vertexAICompatCount,
 		openAICompatCount,
 	)
+}
+
+// StartCodexCleanup delegates to the management handler's codex cleanup goroutine.
+func (s *Server) StartCodexCleanup(ctx context.Context) {
+	if s == nil || s.mgmt == nil {
+		return
+	}
+	s.mgmt.StartCodexCleanup(ctx)
 }
 
 func (s *Server) SetWebsocketAuthChangeHandler(fn func(bool, bool)) {

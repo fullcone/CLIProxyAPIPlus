@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"time"
 )
 
 // OAuthError represents an OAuth-specific error.
@@ -168,4 +169,30 @@ func GetUserFriendlyMessage(err error) string {
 	default:
 		return "An unexpected error occurred. Please try again."
 	}
+}
+
+// RefreshError represents a token refresh failure that carries the upstream HTTP
+// status code and an optional Retry-After duration parsed from the response.
+type RefreshError struct {
+	// Msg is a human-readable description of the refresh failure.
+	Msg string
+	// Code is the HTTP status code returned by the token endpoint.
+	Code int
+	// Retry *time.Duration is the parsed retry-after duration, if provided.
+	Retry *time.Duration
+}
+
+// Error implements the error interface.
+func (e *RefreshError) Error() string {
+	return e.Msg
+}
+
+// StatusCode returns the HTTP status code of the refresh failure.
+func (e *RefreshError) StatusCode() int {
+	return e.Code
+}
+
+// RetryAfter returns the parsed retry-after duration, or nil if not available.
+func (e *RefreshError) RetryAfter() *time.Duration {
+	return e.Retry
 }

@@ -66,6 +66,7 @@ const (
 	refreshFailureBackoff = 1 * time.Minute
 	quotaBackoffBase      = time.Second
 	quotaBackoffMax       = 30 * time.Minute
+	codexQuotaCooldown    = 24 * time.Hour
 )
 
 var quotaCooldownDisabled atomic.Bool
@@ -160,6 +161,10 @@ type Manager struct {
 
 	// Optional HTTP RoundTripper provider injected by host.
 	rtProvider RoundTripperProvider
+
+	// codexInflight tracks which codex auth IDs currently have a request in flight.
+	// Only used for codex provider auths to prevent concurrent requests on the same credential.
+	codexInflight sync.Map
 
 	// Auto refresh state
 	refreshCancel    context.CancelFunc
@@ -724,6 +729,26 @@ func (m *Manager) wrapStreamResult(ctx context.Context, auth *Auth, provider, re
 	return &cliproxyexecutor.StreamResult{Headers: headers, Chunks: out}
 }
 
+// wrapCodexInflightStream wraps a StreamResult's Chunks channel so that the
+// codex in-flight slot is released when the stream is fully consumed or closed.
+func (m *Manager) wrapCodexInflightStream(authID string, sr *cliproxyexecutor.StreamResult) *cliproxyexecutor.StreamResult {
+	if sr == nil {
+		m.codexInflight.Delete(authID)
+		return nil
+	}
+	out := make(chan cliproxyexecutor.StreamChunk)
+	go func() {
+		defer func() {
+			m.codexInflight.Delete(authID)
+			close(out)
+		}()
+		for chunk := range sr.Chunks {
+			out <- chunk
+		}
+	}()
+	return &cliproxyexecutor.StreamResult{Headers: sr.Headers, Chunks: out}
+}
+
 func (m *Manager) executeStreamWithModelPool(ctx context.Context, executor ProviderExecutor, auth *Auth, provider string, req cliproxyexecutor.Request, opts cliproxyexecutor.Options, routeModel string, execModels []string, pooled bool) (*cliproxyexecutor.StreamResult, error) {
 	if executor == nil {
 		return nil, &Error{Code: "executor_not_found", Message: "executor not registered"}
@@ -1006,7 +1031,9 @@ func (m *Manager) Register(ctx context.Context, auth *Auth) (*Auth, error) {
 	m.mu.Lock()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
-	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	if _, hasAPIKey := auth.Attributes["api_key"]; hasAPIKey {
+		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	}
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
 	}
@@ -1036,7 +1063,9 @@ func (m *Manager) Update(ctx context.Context, auth *Auth) (*Auth, error) {
 	authClone := auth.Clone()
 	m.auths[auth.ID] = authClone
 	m.mu.Unlock()
-	m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	if _, hasAPIKey := auth.Attributes["api_key"]; hasAPIKey {
+		m.rebuildAPIKeyModelAliasFromRuntimeConfig()
+	}
 	if m.scheduler != nil {
 		m.scheduler.upsertAuth(authClone)
 	}
@@ -1197,6 +1226,16 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
 		tried[auth.ID] = struct{}{}
+
+		// For codex providers, enforce per-auth in-flight protection.
+		// If this auth already has a request in flight, skip it without
+		// consuming maxRetryCredentials.
+		if strings.EqualFold(provider, "codex") {
+			if _, loaded := m.codexInflight.LoadOrStore(auth.ID, struct{}{}); loaded {
+				continue
+			}
+		}
+
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -1205,6 +1244,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
+			if strings.EqualFold(provider, "codex") {
+				m.codexInflight.Delete(auth.ID)
+			}
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
@@ -1217,6 +1259,9 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 			result := Result{AuthID: auth.ID, Provider: provider, Model: resultModel, Success: errExec == nil}
 			if errExec != nil {
 				if errCtx := execCtx.Err(); errCtx != nil {
+					if strings.EqualFold(provider, "codex") {
+						m.codexInflight.Delete(auth.ID)
+					}
 					return cliproxyexecutor.Response{}, errCtx
 				}
 				result.Error = &Error{Message: errExec.Error()}
@@ -1228,13 +1273,23 @@ func (m *Manager) executeMixedOnce(ctx context.Context, providers []string, req 
 				}
 				m.MarkResult(execCtx, result)
 				if isRequestInvalidError(errExec) {
+					if strings.EqualFold(provider, "codex") {
+						m.codexInflight.Delete(auth.ID)
+					}
 					return cliproxyexecutor.Response{}, errExec
 				}
 				authErr = errExec
 				continue
 			}
 			m.MarkResult(execCtx, result)
+			if strings.EqualFold(provider, "codex") {
+				m.codexInflight.Delete(auth.ID)
+			}
 			return resp, nil
+		}
+		// Release in-flight after all models for this auth have been tried.
+		if strings.EqualFold(provider, "codex") {
+			m.codexInflight.Delete(auth.ID)
 		}
 		if authErr != nil {
 			if isRequestInvalidError(authErr) {
@@ -1361,6 +1416,14 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		publishSelectedAuthMetadata(opts.Metadata, auth.ID)
 
 		tried[auth.ID] = struct{}{}
+
+		// For codex providers, enforce per-auth in-flight protection.
+		if strings.EqualFold(provider, "codex") {
+			if _, loaded := m.codexInflight.LoadOrStore(auth.ID, struct{}{}); loaded {
+				continue
+			}
+		}
+
 		execCtx := ctx
 		if rt := m.roundTripperFor(auth); rt != nil {
 			execCtx = context.WithValue(execCtx, roundTripperContextKey{}, rt)
@@ -1368,11 +1431,17 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 		}
 		models, pooled := m.preparedExecutionModels(auth, routeModel)
 		if len(models) == 0 {
+			if strings.EqualFold(provider, "codex") {
+				m.codexInflight.Delete(auth.ID)
+			}
 			continue
 		}
 		attempted[auth.ID] = struct{}{}
 		streamResult, errStream := m.executeStreamWithModelPool(execCtx, executor, auth, provider, req, opts, routeModel, models, pooled)
 		if errStream != nil {
+			if strings.EqualFold(provider, "codex") {
+				m.codexInflight.Delete(auth.ID)
+			}
 			if errCtx := execCtx.Err(); errCtx != nil {
 				return nil, errCtx
 			}
@@ -1381,6 +1450,10 @@ func (m *Manager) executeStreamMixedOnce(ctx context.Context, providers []string
 			}
 			lastErr = errStream
 			continue
+		}
+		// For codex providers, wrap the stream channel to release in-flight when stream completes.
+		if strings.EqualFold(provider, "codex") {
+			streamResult = m.wrapCodexInflightStream(auth.ID, streamResult)
 		}
 		return streamResult, nil
 	}
@@ -1878,7 +1951,7 @@ func (m *Manager) MarkResult(ctx context.Context, result Result) {
 							if result.RetryAfter != nil {
 								next = now.Add(*result.RetryAfter)
 							} else {
-								cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth))
+								cooldown, nextLevel := nextQuotaCooldown(backoffLevel, quotaCooldownDisabledForAuth(auth), auth.Provider)
 								if cooldown > 0 {
 									next = now.Add(cooldown)
 								}
@@ -2224,6 +2297,15 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 	switch statusCode {
 	case 401:
 		auth.StatusMessage = "unauthorized"
+		// Preserve terminal error messages that contain specific revocation details.
+		if resultErr != nil && resultErr.Message != "" {
+			msgLower := strings.ToLower(resultErr.Message)
+			if strings.Contains(msgLower, "token_revoked") ||
+				strings.Contains(msgLower, "invalidated oauth token") ||
+				strings.Contains(msgLower, "token has been invalidated") {
+				auth.StatusMessage = resultErr.Message
+			}
+		}
 		auth.NextRetryAfter = now.Add(30 * time.Minute)
 	case 402, 403:
 		auth.StatusMessage = "payment_required"
@@ -2239,7 +2321,7 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 		if retryAfter != nil {
 			next = now.Add(*retryAfter)
 		} else {
-			cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, quotaCooldownDisabledForAuth(auth))
+			cooldown, nextLevel := nextQuotaCooldown(auth.Quota.BackoffLevel, quotaCooldownDisabledForAuth(auth), auth.Provider)
 			if cooldown > 0 {
 				next = now.Add(cooldown)
 			}
@@ -2262,7 +2344,14 @@ func applyAuthFailureState(auth *Auth, resultErr *Error, retryAfter *time.Durati
 }
 
 // nextQuotaCooldown returns the next cooldown duration and updated backoff level for repeated quota errors.
-func nextQuotaCooldown(prevLevel int, disableCooling bool) (time.Duration, int) {
+// For codex providers, a fixed 24-hour cooldown is used without level escalation.
+func nextQuotaCooldown(prevLevel int, disableCooling bool, provider string) (time.Duration, int) {
+	if strings.EqualFold(provider, "codex") {
+		if disableCooling {
+			return 0, prevLevel
+		}
+		return codexQuotaCooldown, prevLevel
+	}
 	if prevLevel < 0 {
 		prevLevel = 0
 	}
@@ -3004,8 +3093,35 @@ func (m *Manager) refreshAuth(ctx context.Context, id string) {
 	if err != nil {
 		m.mu.Lock()
 		if current := m.auths[id]; current != nil {
-			current.NextRefreshAfter = now.Add(refreshFailureBackoff)
-			current.LastError = &Error{Message: err.Error()}
+			// Build a result error and extract status/retry-after via interfaces
+			// so that applyAuthFailureState can apply provider-aware backoff.
+			resultErr := &Error{Message: err.Error()}
+			if sc, ok := err.(interface{ StatusCode() int }); ok {
+				resultErr.HTTPStatus = sc.StatusCode()
+			}
+			var retryAfter *time.Duration
+			if ra, ok := err.(interface{ RetryAfter() *time.Duration }); ok {
+				retryAfter = ra.RetryAfter()
+			}
+			// Walk wrapped errors if top-level doesn't implement the interfaces.
+			if resultErr.HTTPStatus == 0 {
+				var unwrapped interface{ StatusCode() int }
+				if errors.As(err, &unwrapped) {
+					resultErr.HTTPStatus = unwrapped.StatusCode()
+				}
+			}
+			if retryAfter == nil {
+				var unwrapped interface{ RetryAfter() *time.Duration }
+				if errors.As(err, &unwrapped) {
+					retryAfter = unwrapped.RetryAfter()
+				}
+			}
+			applyAuthFailureState(current, resultErr, retryAfter, now)
+			// Ensure NextRefreshAfter is at least refreshFailureBackoff from now.
+			minRefresh := now.Add(refreshFailureBackoff)
+			if current.NextRefreshAfter.Before(minRefresh) {
+				current.NextRefreshAfter = minRefresh
+			}
 			m.auths[id] = current
 			if m.scheduler != nil {
 				m.scheduler.upsertAuth(current.Clone())

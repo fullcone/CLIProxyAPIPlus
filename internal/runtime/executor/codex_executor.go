@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	codexauth "github.com/router-for-me/CLIProxyAPI/v6/internal/auth/codex"
@@ -34,6 +35,9 @@ const (
 )
 
 var dataTag = []byte("data:")
+
+// codexAuthCache caches CodexAuth service instances keyed by normalized route.
+var codexAuthCache sync.Map
 
 // CodexExecutor is a stateless executor for Codex (OpenAI Responses API entrypoint).
 // If api_key is unavailable on auth, it falls back to legacy via ClientAdapter.
@@ -570,9 +574,36 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	if refreshToken == "" {
 		return auth, nil
 	}
-	svc := codexauth.NewCodexAuth(e.cfg)
+
+	// Build cache key for the CodexAuth service instance.
+	var proxyURL string
+	if auth != nil {
+		proxyURL = strings.TrimSpace(auth.ProxyURL)
+	}
+	if proxyURL == "" && e.cfg != nil {
+		proxyURL = strings.TrimSpace(e.cfg.ProxyURL)
+	}
+	var ipv6 string
+	if auth.Metadata != nil {
+		if v, ok := auth.Metadata["ipv6"].(string); ok {
+			ipv6 = v
+		}
+	}
+	cacheKey := helps.NormalizeRouteKey(proxyURL, auth.ID, ipv6)
+
+	// Load or create cached CodexAuth service.
+	var svc *codexauth.CodexAuth
+	if cached, ok := codexAuthCache.Load(cacheKey); ok {
+		svc = cached.(*codexauth.CodexAuth)
+	} else {
+		svc = codexauth.NewCodexAuth(e.cfg, ipv6)
+		codexAuthCache.Store(cacheKey, svc)
+	}
+
 	td, err := svc.RefreshTokensWithRetry(ctx, refreshToken, 3)
 	if err != nil {
+		// Return the error directly so typed errors (e.g. RefreshError with
+		// StatusCode/RetryAfter) are preserved for the caller.
 		return nil, err
 	}
 	if auth.Metadata == nil {
@@ -592,6 +623,22 @@ func (e *CodexExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*
 	auth.Metadata["type"] = "codex"
 	now := time.Now().Format(time.RFC3339)
 	auth.Metadata["last_refresh"] = now
+
+	// Sync back to CodexTokenStorage if present, so on-disk state stays current.
+	if ts, ok := auth.Storage.(*codexauth.CodexTokenStorage); ok && ts != nil {
+		ts.IDToken = td.IDToken
+		ts.AccessToken = td.AccessToken
+		if td.RefreshToken != "" {
+			ts.RefreshToken = td.RefreshToken
+		}
+		if td.AccountID != "" {
+			ts.AccountID = td.AccountID
+		}
+		ts.Email = td.Email
+		ts.Expire = td.Expire
+		ts.LastRefresh = now
+	}
+
 	return auth, nil
 }
 

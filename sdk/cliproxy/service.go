@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/router-for-me/CLIProxyAPI/v6/internal/api"
@@ -90,6 +91,15 @@ type Service struct {
 
 	// wsGateway manages websocket Gemini providers.
 	wsGateway *wsrelay.Manager
+
+	// applyWorker is a buffered channel for decoupled model registration and
+	// scheduler refresh work produced by applyCoreAuthAddOrUpdate.
+	applyWorker     chan applyWork
+	applyWorkerStop context.CancelFunc
+
+	// applyInFlight tracks the number of apply work items currently being processed
+	// by the background worker. Used by startup stability detection.
+	applyInFlight atomic.Int64
 }
 
 // RegisterUsagePlugin registers a usage plugin on the global usage manager.
@@ -121,6 +131,41 @@ func newDefaultAuthManager() *sdkAuth.Manager {
 		sdkAuth.NewQwenAuthenticator(),
 		sdkAuth.NewGitLabAuthenticator(),
 	)
+}
+
+// applyWork encapsulates a deferred model registration + scheduler refresh task.
+type applyWork struct {
+	auth *coreauth.Auth
+}
+
+// ensureApplyWorker starts the background goroutine that processes deferred
+// registerModelsForAuth + RefreshSchedulerEntry work. This prevents batch
+// auth imports from blocking the main auth update queue.
+func (s *Service) ensureApplyWorker(ctx context.Context) {
+	if s == nil {
+		return
+	}
+	if s.applyWorker != nil {
+		return
+	}
+	s.applyWorker = make(chan applyWork, 256)
+	workerCtx, cancel := context.WithCancel(ctx)
+	s.applyWorkerStop = cancel
+	go func() {
+		for {
+			select {
+			case <-workerCtx.Done():
+				return
+			case work, ok := <-s.applyWorker:
+				if !ok {
+					return
+				}
+				s.registerModelsForAuth(work.auth)
+				s.coreManager.RefreshSchedulerEntry(work.auth.ID)
+				s.applyInFlight.Add(-1)
+			}
+		}
+	}()
 }
 
 func (s *Service) ensureAuthUpdateQueue(ctx context.Context) {
@@ -320,16 +365,24 @@ func (s *Service) applyCoreAuthAddOrUpdate(ctx context.Context, auth *coreauth.A
 		auth = current
 	}
 
-	// Register models after auth is updated in coreManager.
-	// This operation may block on network calls, but the auth configuration
-	// is already effective at this point.
-	s.registerModelsForAuth(auth)
-
-	// Refresh the scheduler entry so that the auth's supportedModelSet is rebuilt
-	// from the now-populated global model registry. Without this, newly added auths
-	// have an empty supportedModelSet (because Register/Update upserts into the
-	// scheduler before registerModelsForAuth runs) and are invisible to the scheduler.
-	s.coreManager.RefreshSchedulerEntry(auth.ID)
+	// Decouple model registration + scheduler refresh to the apply worker.
+	// This prevents batch account imports from blocking the auth update main queue.
+	// The coreManager state is already up-to-date at this point.
+	if s.applyWorker != nil {
+		s.applyInFlight.Add(1)
+		select {
+		case s.applyWorker <- applyWork{auth: auth}:
+		default:
+			// Worker channel full: fall back to inline execution.
+			s.registerModelsForAuth(auth)
+			s.coreManager.RefreshSchedulerEntry(auth.ID)
+			s.applyInFlight.Add(-1)
+		}
+	} else {
+		// No worker yet (pre-Run): execute synchronously.
+		s.registerModelsForAuth(auth)
+		s.coreManager.RefreshSchedulerEntry(auth.ID)
+	}
 }
 
 func (s *Service) applyCoreAuthRemoval(ctx context.Context, id string) {
@@ -690,6 +743,10 @@ func (s *Service) Run(ctx context.Context) error {
 		s.rebindExecutors()
 	}
 
+	// Start the apply worker before the watcher so that auth updates arriving
+	// from the initial scan can be processed asynchronously.
+	s.ensureApplyWorker(ctx)
+
 	watcherWrapper, err = s.watcherFactory(s.configPath, s.cfg.AuthDir, reloadCallback)
 	if err != nil {
 		return fmt.Errorf("cliproxy: failed to create watcher: %w", err)
@@ -726,6 +783,9 @@ func (s *Service) Run(ctx context.Context) error {
 		s.coreManager.StartAutoRefresh(context.Background(), interval)
 		log.Infof("core auth auto-refresh started (interval=%s)", interval)
 	}
+
+	// Launch startup stability detection and codex cleanup in the background.
+	go s.waitForStabilityAndStartCleanup(ctx)
 
 	select {
 	case <-ctx.Done():
@@ -781,6 +841,10 @@ func (s *Service) Shutdown(ctx context.Context) error {
 			s.authQueueStop()
 			s.authQueueStop = nil
 		}
+		if s.applyWorkerStop != nil {
+			s.applyWorkerStop()
+			s.applyWorkerStop = nil
+		}
 
 		if errShutdownPprof := s.shutdownPprof(ctx); errShutdownPprof != nil {
 			log.Errorf("failed to stop pprof server: %v", errShutdownPprof)
@@ -805,6 +869,67 @@ func (s *Service) Shutdown(ctx context.Context) error {
 		usage.StopDefault()
 	})
 	return shutdownErr
+}
+
+// waitForStabilityAndStartCleanup blocks until the auth update pipeline has
+// stabilised after startup, then launches the codex cleanup goroutine.
+//
+// Stability is defined as: the authUpdates channel is empty, the watcher has
+// no pending updates, and there are no in-flight apply worker tasks. The
+// method polls at short intervals and declares stability when these conditions
+// hold for two consecutive checks. A 2-minute timeout acts as a fallback
+// warning but does NOT count as "stable".
+func (s *Service) waitForStabilityAndStartCleanup(ctx context.Context) {
+	const (
+		pollInterval   = 500 * time.Millisecond
+		stabilityGoal  = 2 // consecutive stable polls required
+		timeoutWarning = 2 * time.Minute
+	)
+
+	deadline := time.After(timeoutWarning)
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	stableRuns := 0
+	timedOut := false
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-deadline:
+			log.Warn("codex cleanup: startup stability timeout reached (2m); proceeding with cleanup launch")
+			timedOut = true
+		case <-ticker.C:
+		}
+
+		if timedOut {
+			break
+		}
+
+		channelBacklog := len(s.authUpdates)
+		watcherPending := 0
+		if s.watcher != nil {
+			watcherPending = s.watcher.PendingUpdateCount()
+		}
+		inFlight := int(s.applyInFlight.Load())
+
+		if channelBacklog == 0 && watcherPending == 0 && inFlight == 0 {
+			stableRuns++
+			if stableRuns >= stabilityGoal {
+				log.Infof("codex cleanup: auth update pipeline stable after %d consecutive checks", stableRuns)
+				break
+			}
+		} else {
+			stableRuns = 0
+			log.Debugf("codex cleanup: waiting for stability — channel=%d watcher=%d inflight=%d",
+				channelBacklog, watcherPending, inFlight)
+		}
+	}
+
+	if s.server != nil {
+		s.server.StartCodexCleanup(ctx)
+	}
 }
 
 func (s *Service) ensureAuthDir() error {

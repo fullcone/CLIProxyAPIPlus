@@ -197,6 +197,14 @@ func (h *OpenAIResponsesAPIHandler) ResponsesWebsocket(c *gin.Context) {
 			return
 		}
 		lastResponseOutput = completedOutput
+
+		// Check if pinned auth should be unpinned after this request.
+		if pinnedAuthID != "" {
+			if resetPinnedResponsesAuthIfBlocked(h, pinnedAuthID, passthroughSessionID, errForward) {
+				log.Infof("responses websocket: unpinned auth=%s session=%s", pinnedAuthID, passthroughSessionID)
+				pinnedAuthID = ""
+			}
+		}
 	}
 }
 
@@ -1028,4 +1036,72 @@ func markAPIResponseTimestamp(c *gin.Context) {
 		return
 	}
 	c.Set("API_RESPONSE_TIMESTAMP", time.Now())
+}
+
+// resetPinnedResponsesAuthIfBlocked checks whether the pinned auth should be
+// unpinned after a request.  It returns true when:
+//   - The auth record is missing, disabled, or unavailable with NextRetryAfter.
+//   - The model is disabled or model unavailable with NextRetryAfter.
+//   - The auth is in cooldown.
+//   - The forward error contains a terminal error (token revoked, invalidated, deactivated).
+//
+// On unpin it calls AuthManager.CloseExecutionSession for the session.
+func resetPinnedResponsesAuthIfBlocked(h *OpenAIResponsesAPIHandler, pinnedAuthID, sessionID string, forwardErr error) bool {
+	if h == nil || h.AuthManager == nil || strings.TrimSpace(pinnedAuthID) == "" {
+		return false
+	}
+
+	// Check for terminal errors in the forward error message.
+	if forwardErr != nil && isTerminalAuthError(forwardErr) {
+		h.AuthManager.CloseExecutionSession(sessionID)
+		return true
+	}
+
+	auth, ok := h.AuthManager.GetByID(pinnedAuthID)
+	if !ok || auth == nil {
+		h.AuthManager.CloseExecutionSession(sessionID)
+		return true
+	}
+
+	// Auth disabled.
+	if auth.Disabled || auth.Status == coreauth.StatusDisabled {
+		h.AuthManager.CloseExecutionSession(sessionID)
+		return true
+	}
+
+	// Auth unavailable with retry-after.
+	now := time.Now()
+	if auth.Unavailable && !auth.NextRetryAfter.IsZero() && auth.NextRetryAfter.After(now) {
+		h.AuthManager.CloseExecutionSession(sessionID)
+		return true
+	}
+
+	// Auth in quota cooldown.
+	if auth.Quota.Exceeded && !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
+		h.AuthManager.CloseExecutionSession(sessionID)
+		return true
+	}
+
+	return false
+}
+
+// isTerminalAuthError matches error messages that indicate the auth credential
+// is permanently broken and should not be retried.
+func isTerminalAuthError(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := strings.ToLower(err.Error())
+	terminalPatterns := []string{
+		"token_revoked",
+		"invalidated oauth token",
+		"token has been invalidated",
+		"account has been deactivated",
+	}
+	for _, pattern := range terminalPatterns {
+		if strings.Contains(msg, pattern) {
+			return true
+		}
+	}
+	return false
 }

@@ -405,6 +405,14 @@ func isAuthBlockedForModel(auth *Auth, model string, now time.Time) (bool, block
 		}
 		return false, blockReasonNone, time.Time{}
 	}
+	// For codex providers, check auth-level quota even when no per-model state exists.
+	if strings.EqualFold(auth.Provider, "codex") && auth.Quota.Exceeded && auth.NextRetryAfter.After(now) {
+		next := auth.NextRetryAfter
+		if !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {
+			next = auth.Quota.NextRecoverAt
+		}
+		return true, blockReasonCooldown, next
+	}
 	if auth.Unavailable && auth.NextRetryAfter.After(now) {
 		next := auth.NextRetryAfter
 		if !auth.Quota.NextRecoverAt.IsZero() && auth.Quota.NextRecoverAt.After(now) {

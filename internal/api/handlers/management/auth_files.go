@@ -1398,6 +1398,37 @@ func (h *Handler) saveTokenRecord(ctx context.Context, record *coreauth.Auth) (s
 	return store.Save(ctx, record)
 }
 
+// isRetryableExchangeErr returns true for transient network errors that justify
+// retrying the OAuth code-for-tokens exchange: EOF, connection reset/refused,
+// timeout, and HTTP 5xx responses surfaced via codex.OAuthError.
+func isRetryableExchangeErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	// HTTP 5xx from OAuth endpoint.
+	var oauthErr *codex.OAuthError
+	if errors.As(err, &oauthErr) {
+		return oauthErr.StatusCode >= 500 && oauthErr.StatusCode < 600
+	}
+	msg := strings.ToLower(err.Error())
+	switch {
+	case errors.Is(err, io.EOF):
+		return true
+	case strings.Contains(msg, "connection reset"):
+		return true
+	case strings.Contains(msg, "connection refused"):
+		return true
+	case strings.Contains(msg, "timeout"), strings.Contains(msg, "deadline exceeded"):
+		return true
+	}
+	// Check for net.Error timeout.
+	var netErr net.Error
+	if errors.As(err, &netErr) && netErr.Timeout() {
+		return true
+	}
+	return false
+}
+
 func gitLabBaseURLFromRequest(c *gin.Context) string {
 	if c != nil {
 		if raw := strings.TrimSpace(c.Query("base_url")); raw != "" {
@@ -2055,8 +2086,47 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		}
 
 		log.Debug("Authorization code received, exchanging for tokens...")
-		// Exchange code for tokens using internal auth service
-		bundle, errExchange := openaiAuth.ExchangeCodeForTokens(ctx, code, pkceCodes)
+
+		// Allocate an IPv6 address for the token exchange if the pool is available.
+		reservationKey := "codex-oauth:" + state
+		ipv6Pool := GetGlobalIPv6Pool()
+		var exchangeIPv6 string
+		if ipv6Pool != nil {
+			if addr, errAlloc := ipv6Pool.Allocate(reservationKey); errAlloc == nil {
+				exchangeIPv6 = addr
+				log.Debugf("codex oauth: allocated IPv6 %s for exchange reservation=%s", addr, reservationKey)
+			}
+		}
+		// If the goroutine exits without completing, release the reservation.
+		exchangeIPv6Released := false
+		defer func() {
+			if !exchangeIPv6Released && ipv6Pool != nil {
+				ipv6Pool.Release(reservationKey)
+			}
+		}()
+
+		// Recreate the CodexAuth with IPv6 binding for the exchange request.
+		if exchangeIPv6 != "" {
+			openaiAuth = codex.NewCodexAuth(h.cfg, exchangeIPv6)
+		}
+
+		// Exchange code for tokens using internal auth service with retry.
+		const maxExchangeAttempts = 4
+		var bundle *codex.CodexAuthBundle
+		var errExchange error
+		for attempt := 1; attempt <= maxExchangeAttempts; attempt++ {
+			bundle, errExchange = openaiAuth.ExchangeCodeForTokens(ctx, code, pkceCodes)
+			if errExchange == nil {
+				break
+			}
+			if attempt < maxExchangeAttempts && isRetryableExchangeErr(errExchange) {
+				backoff := time.Duration(1<<uint(attempt)) * time.Second // 2s, 4s, 8s
+				log.Warnf("codex token exchange attempt %d/%d failed (retrying in %v): %v", attempt, maxExchangeAttempts, backoff, errExchange)
+				time.Sleep(backoff)
+				continue
+			}
+			break
+		}
 		if errExchange != nil {
 			authErr := codex.NewAuthenticationError(codex.ErrCodeExchangeFailed, errExchange)
 			SetOAuthSessionError(state, "Failed to exchange authorization code for tokens")
@@ -2079,29 +2149,47 @@ func (h *Handler) RequestCodexToken(c *gin.Context) {
 		// Create token storage and persist
 		tokenStorage := openaiAuth.CreateTokenStorage(bundle)
 		fileName := codex.CredentialFileName(tokenStorage.Email, planType, hashAccountID, true)
+		recordMeta := map[string]any{
+			"email":      tokenStorage.Email,
+			"account_id": tokenStorage.AccountID,
+		}
+		// Transfer IPv6 allocation from the reservation to the auth record ID.
+		if ipv6Pool != nil && exchangeIPv6 != "" {
+			ipv6Pool.Transfer(reservationKey, fileName)
+			exchangeIPv6Released = true // ownership transferred
+			recordMeta["ipv6"] = exchangeIPv6
+		}
 		record := &coreauth.Auth{
 			ID:       fileName,
 			Provider: "codex",
 			FileName: fileName,
 			Storage:  tokenStorage,
-			Metadata: map[string]any{
-				"email":      tokenStorage.Email,
-				"account_id": tokenStorage.AccountID,
-			},
+			Metadata: recordMeta,
 		}
 		savedPath, errSave := h.saveTokenRecord(ctx, record)
 		if errSave != nil {
+			// Release IPv6 from the transferred owner on save failure.
+			if ipv6Pool != nil && exchangeIPv6Released {
+				ipv6Pool.Release(fileName)
+			}
 			SetOAuthSessionError(state, "Failed to save authentication tokens")
 			log.Errorf("Failed to save authentication tokens: %v", errSave)
 			return
 		}
+
+		// Immediately register the new auth record into the authManager so that
+		// it is available for routing without waiting for the next file-scan cycle.
+		// Use WithSkipPersist to avoid double-writing the file we just saved.
+		if errReg := h.upsertAuthRecord(coreauth.WithSkipPersist(ctx), record); errReg != nil {
+			log.Warnf("codex oauth: failed to register auth record after save: %v", errReg)
+		}
+
 		fmt.Printf("Authentication successful! Token saved to %s\n", savedPath)
 		if bundle.APIKey != "" {
 			fmt.Println("API key obtained and saved")
 		}
 		fmt.Println("You can now use Codex services through this CLI")
 		CompleteOAuthSession(state)
-		CompleteOAuthSessionsByProvider("codex")
 	}()
 
 	c.JSON(200, gin.H{"status": "ok", "url": authURL, "state": state})

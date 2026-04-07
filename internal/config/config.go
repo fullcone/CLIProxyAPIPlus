@@ -106,6 +106,10 @@ type Config struct {
 	// These are used only when the client does not send its own headers.
 	CodexHeaderDefaults CodexHeaderDefaults `yaml:"codex-header-defaults" json:"codex-header-defaults"`
 
+	// IPv6Prefix is the /48 or /64 prefix used for outbound IPv6 address allocation.
+	// When set, each Codex OAuth session binds to a unique address from this prefix.
+	IPv6Prefix string `yaml:"ipv6-prefix" json:"ipv6-prefix"`
+
 	// ClaudeKey defines a list of Claude API key configurations as specified in the YAML configuration file.
 	ClaudeKey []ClaudeKey `yaml:"claude-api-key" json:"claude-api-key"`
 
